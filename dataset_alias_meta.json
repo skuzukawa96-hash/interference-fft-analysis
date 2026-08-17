@@ -1,0 +1,6 @@
+{
+  "kind": "alias",
+  "delta_lambda_nm": 0.5,
+  "nyquist_per_100nm": 100.0,
+  "note": "真の波数がナイキスト限界を超える列は 2*f_n - w に折り返される。"
+}

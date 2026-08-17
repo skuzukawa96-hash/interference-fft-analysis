@@ -1,0 +1,11 @@
+{
+  "kind": "highfreq",
+  "delta_lambda_nm": 0.5,
+  "nyquist_per_100nm": 100.0,
+  "expected_regression": {
+    "slope": 1.0,
+    "intercept": 0.0
+  },
+  "expected_condition_at_nyquist": 100.0,
+  "note": "条件値がそのまま波数 [波数/100nm] になる。回帰直線は y = x。"
+}

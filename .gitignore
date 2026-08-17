@@ -1,0 +1,19 @@
+# 解析結果の出力 (ツールを実行すれば再生成できる)
+output/
+output_*/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# エディタ / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Excel の一時ファイル
+~$*.xlsx

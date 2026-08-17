@@ -1,0 +1,14 @@
+{
+  "kind": "film",
+  "refractive_index": 1.5,
+  "delta_lambda_nm": 0.25,
+  "n_points": 1201,
+  "nyquist_opd_nm": 1400000.0000000002,
+  "nyquist_per_100nm_lambda_domain": 200.0,
+  "expected_regression_wavenumber_domain": {
+    "slope_nm_per_um": 3000.0,
+    "intercept": 0.0
+  },
+  "expected_condition_at_nyquist_um": 466.66666666666674,
+  "note": "条件列は膜厚 [μm]。波数ドメイン FFT のピークは OPD = 2nd [nm] に立つ。波長ドメインでは帯域内で縞間隔が変化するためピークが広がる。"
+}
