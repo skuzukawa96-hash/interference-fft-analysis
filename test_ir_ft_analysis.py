@@ -20,11 +20,14 @@ import pandas as pd
 
 import make_testdata as mtd
 from ir_ft_analysis import (DEFAULT_GRID_POINTS, FIT_R2_WARN, GRID_HALF_WIDTH,
-                            WINDOW_FUNCTIONS, analyze_band, fit_regression,
-                            interpolate, is_near_nyquist, load_spectra,
-                            make_window, parse_band, peaks_dataframe,
-                            refine_peak_fit, resolve_domain,
-                            resolve_window_name)
+                            WINDOW_FUNCTIONS, absorption_thickness_limit,
+                            analyze_band, cauchy_index, constant_index,
+                            effective_index, fit_regression, interpolate,
+                            is_near_nyquist, layer_reflectance, load_spectra,
+                            make_window, parse_band, parse_cauchy,
+                            peaks_dataframe, refine_peak_fit,
+                            refine_reflectance_fit, resolve_domain,
+                            resolve_window_name, table_index)
 
 TMP = Path(tempfile.mkdtemp(prefix="ir_ft_test_"))
 _failures: list[str] = []
@@ -345,6 +348,163 @@ def test_peak_refinement() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 10. 論文のその他の手法: 分散・式 8・反射率モデル・PSD × m²
+# ---------------------------------------------------------------------------
+
+def test_paper_methods() -> None:
+    print("\n[10] 論文のその他の手法 (式 1, 6, 7, 8, 15, 17 と PSD × m²)")
+
+    # --- 屈折率モデル -------------------------------------------------------
+    cau = cauchy_index(parse_cauchy("1.56, 0.005"))
+    check("Cauchy の式 n(500 nm) = 1.56 + 0.005/0.25",
+          abs(cau.n(500.0) - 1.58) < 1e-12, f"{float(cau.n(500.0)):.6f}")
+    table = TMP / "index_table.csv"
+    pd.DataFrame({"wl": [400, 700, 1000], "n": [1.60, 1.57, 1.55],
+                  "k": [0.002, 0.001, 0.0]}).to_csv(table, index=False)
+    tab = table_index(table)
+    check("屈折率テーブルを線形補間する", abs(tab.n(550.0) - 1.585) < 1e-12
+          and abs(tab.k(550.0) - 0.0015) < 1e-12, f"n={float(tab.n(550.0)):.4f}")
+    try:
+        tab.n(1200.0)
+        out_of_range = False
+    except ValueError:
+        out_of_range = True
+    check("テーブルの範囲外はエラーにする", out_of_range)
+
+    # --- 式 7: 有効屈折率 ---------------------------------------------------
+    check("一定の屈折率なら n_eff = n",
+          abs(effective_index(constant_index(1.5), 400, 1000) - 1.5) < 1e-12)
+    s1, s2 = 1 / 0.4, 1 / 1.0                       # µm⁻¹
+    analytic = 1.56 + 0.005 * (s1 ** 2 + s1 * s2 + s2 ** 2)
+    check("Cauchy の n_eff が解析解 A + B(σ1² + σ1σ2 + σ2²) と一致",
+          abs(effective_index(cau, 400, 1000) - analytic) < 1e-12, f"{analytic:.5f}")
+
+    # --- 式 1, 15: 反射率モデル ---------------------------------------------
+    wl = np.linspace(400, 1000, 61)
+    nf = cau(wl) - 0.01j
+    ns = np.full(wl.size, 3.6 - 0.05j)
+    refl, drefl = layer_reflectance(wl, 23456.0, nf, ns)
+    tm = mtd.single_layer_reflectance(wl, 23456.0, nf, 3.6 - 0.05j)
+    check("Airy の式が特性行列法 (別の導出) と一致 (吸収あり)",
+          np.max(np.abs(refl - tm)) < 1e-12, f"最大差 {np.max(np.abs(refl - tm)):.1e}")
+    h = 1e-3
+    num = (layer_reflectance(wl, 23456.0 + h, nf, ns)[0]
+           - layer_reflectance(wl, 23456.0 - h, nf, ns)[0]) / (2 * h)
+    check("膜厚微分の解析式が数値微分と一致",
+          np.max(np.abs(drefl - num)) < 1e-9 * np.max(np.abs(drefl)) + 1e-12)
+    n1, n2 = 1.5, 3.6
+    r01, r12 = ((1 - n1) / (1 + n1)) ** 2, ((n1 - n2) / (n1 + n2)) ** 2
+    delta = 4 * np.pi * n1 * 23456.0 / wl
+    eq1 = ((r01 + r12 + 2 * np.sqrt(r01 * r12) * np.cos(delta))
+           / (1 + r01 * r12 + 2 * np.sqrt(r01 * r12) * np.cos(delta)))
+    refl_real, _ = layer_reflectance(wl, 23456.0, np.full(wl.size, n1 + 0j),
+                                     np.full(wl.size, n2 + 0j))
+    check("屈折率が実数なら論文の式 (1) と一致", np.max(np.abs(refl_real - eq1)) < 1e-12)
+
+    # --- 分散のある膜: 各手法の膜厚精度 -------------------------------------
+    data, truth, meta = mtd.make_dispersion(noise=0.0)
+    spec = load_spectra(write_csv(data, "dispersion.csv"))
+    td = dict(zip(truth["condition_thickness_um"], truth["true_thickness_nm"]))
+    thick = [r for r in td if r >= 20]
+
+    a_const = analyze_band(spec, 400, 1000, domain="wavenumber",
+                           index=meta["n_at_band_center"])
+    err_const = min(abs(r.estimate / (2 * a_const.n_eff) / td[r.condition] - 1)
+                    for r in a_const.results if r.condition in thick)
+    check("一定の屈折率では厚い膜で 1.5 % 以上ずれる (論文: 最大 2 %)",
+          err_const > 0.015, f"最小でも {err_const * 100:.2f} %")
+
+    a_eff = analyze_band(spec, 400, 1000, domain="wavenumber", index=cau)
+    err_eff = max(abs(r.estimate / (2 * a_eff.n_eff) / td[r.condition] - 1)
+                  for r in a_eff.results if r.condition >= 5)
+    check("有効屈折率 (式 7) で 1 % 未満に改善 (論文: 1 % 未満)",
+          err_eff < 0.01, f"最大 {err_eff * 100:.2f} %")
+
+    a_ref = analyze_band(spec, 400, 1000, domain="wavenumber", index=cau,
+                         substrate=3.6, fit="lm", fit_model="reflectance")
+    err_ref = max(abs(r.fit.thickness - td[r.condition]) for r in a_ref.results)
+    check("反射率モデル + LM で膜厚の誤差 < 0.01 nm (論文: 0.1 nm)",
+          err_ref < 0.01, f"最大 {err_ref:.1e} nm")
+    check("反射率モデルの倍率 ≈ 1 (校正のずれなし)",
+          max(abs(r.fit.scale - 1) for r in a_ref.results) < 1e-6)
+    check("反射率モデルの回帰は光路差換算 2 n_eff d で行う",
+          max(abs(r.estimate - 2 * a_ref.n_eff * r.fit.thickness)
+              for r in a_ref.results) < 1e-6)
+
+    a_fr = analyze_band(spec, 400, 1000, domain="wavenumber", index=cau, fringe=True)
+    err_fr = max(abs(r.fringe.thickness / td[r.condition] - 1)
+                 for r in a_fr.results if r.condition >= 5)
+    check("隣接極大 (式 8) で誤差 < 0.1 %", err_fr < 1e-3, f"最大 {err_fr * 100:.4f} %")
+    check("式 8 は十分な点数があれば信頼できると判定する",
+          all(r.fringe.reliable for r in a_fr.results))
+
+    # --- 反射率モデルの標準誤差 (モンテカルロ) -------------------------------
+    rng = np.random.default_rng(11)
+    x = 1.0 / spec.wavelength[::-1]
+    clean = mtd.single_layer_reflectance(1.0 / x, 20000.0, cau(1.0 / x), 3.6 + 0j)
+    n_eff = effective_index(cau, 400, 1000)
+    d_min = (1.0 / (x.max() - x.min())) / (2 * n_eff)
+    ests, ses = [], []
+    for _ in range(40):
+        y = clean + rng.normal(0.0, 3e-3, x.size)
+        fr = refine_reflectance_fit(x, y, 20000.0 + 50.0, d_min, cau, constant_index(3.6),
+                                    n_eff, degree=0)
+        ests.append(fr.thickness)
+        ses.append(fr.thickness_stderr)
+    ratio = np.std(ests, ddof=1) / np.mean(ses)
+    check("反射率モデルの標準誤差が実際のばらつきと一致 (比 0.7-1.4)",
+          0.7 < ratio < 1.4, f"比 = {ratio:.3f}")
+
+    # --- PSD × m² の重み付き探索 (第 4 章) ----------------------------------
+    data_b, truth_b, _ = mtd.make_background()
+    spec_b = load_spectra(write_csv(data_b, "background.csv"))
+    res = 1.0 / (1.0 / 500 - 1.0 / 1000)
+    a_raw = analyze_band(spec_b, 500, 1000, domain="wavenumber")
+    a_m2 = analyze_band(spec_b, 500, 1000, domain="wavenumber", peak_weight="m2")
+    ok_raw = [abs(r.peak_frequency - t) < 2 * res
+              for r, t in zip(a_raw.results, truth_b["true_opd_nm"])]
+    ok_m2 = [abs(r.peak_frequency - t) < 2 * res
+             for r, t in zip(a_m2.results, truth_b["true_opd_nm"])]
+    check("重みなしではベースラインの残りを拾ってしまう", not any(ok_raw),
+          f"{[round(r.peak_frequency) for r in a_raw.results]}")
+    check("PSD × m² なら全条件で縞のピークを検出できる", all(ok_m2),
+          f"{[round(r.peak_frequency) for r in a_m2.results]}")
+    check("重み付き探索の結果は元の振幅の極大になっている",
+          all(r.amplitude[r.peak_index] >= r.amplitude[r.peak_index - 1]
+              and r.amplitude[r.peak_index] >= r.amplitude[r.peak_index + 1]
+              for r in a_m2.results))
+
+    # --- 式 17: 吸収による最大膜厚の目安 ------------------------------------
+    a_abs = analyze_band(spec, 400, 1000, domain="wavenumber", index=tab)
+    limit = absorption_thickness_limit(a_abs)
+    expected = min(w / k for w, k in ((400, 0.002), (700, 0.001)))
+    check("吸収による最大膜厚 (式 17) = (0.4〜0.75) × min(λ/k)",
+          limit is not None and abs(limit[0] - 0.4 * expected) < 0.01 * expected,
+          f"{limit[0]:.0f}-{limit[1]:.0f} nm" if limit else "None")
+
+    # --- 誤った組み合わせ ---------------------------------------------------
+    errors = []
+    for kwargs in (dict(domain="wavelength", index=cau, fit="lm", fit_model="reflectance"),
+                   dict(domain="wavenumber", fit="lm", fit_model="reflectance"),
+                   dict(domain="wavenumber", fringe=True)):
+        try:
+            analyze_band(spec, 400, 1000, **kwargs)
+            errors.append(False)
+        except ValueError:
+            errors.append(True)
+    check("前提を満たさない組み合わせはエラーにする", all(errors), f"{errors}")
+
+    # --- 出力 ---------------------------------------------------------------
+    df = peaks_dataframe(analyze_band(spec, 400, 1000, domain="wavenumber", index=cau,
+                                      substrate=3.6, fit="lm", fit_model="reflectance",
+                                      fringe=True))
+    need = ["fit_scale", "estimated_thickness_nm", "estimated_thickness_stderr_nm",
+            "fringe_thickness_nm", "fringe_thickness_sem_nm", "fringe_pairs"]
+    check("反射率モデルと式 8 の列が出力される", all(c in df.columns for c in need),
+          f"不足: {[c for c in need if c not in df.columns]}")
+
+
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     print(f"作業ディレクトリ: {TMP}")
@@ -357,6 +517,7 @@ def main() -> int:
     test_robustness()
     test_parsers_and_output()
     test_peak_refinement()
+    test_paper_methods()
 
     print("\n" + "=" * 60)
     if _failures:

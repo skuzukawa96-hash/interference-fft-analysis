@@ -12,6 +12,11 @@ ir_ft_analysis.py の動作確認、特に高周波側 (ナイキスト限界に
                が起きる様子を確認するためのデータ。
     film     : 屈折率 n の平行平板による薄膜干渉モデル。位相が 1/λ に比例
                するため、波数ドメイン FFT の検証用。条件列は膜厚 [μm]。
+    dispersion : 屈折率に分散がある膜 (Cauchy の式) を Si 基板に載せた、
+               多重反射を含む厳密な反射率。有効屈折率 (式 7)、隣接極大からの
+               膜厚 (式 8)、反射率モデルによるフィットの検証用。条件列は膜厚 [μm]。
+    background : 強い山形のベースラインに弱い縞が乗ったデータ。
+               重み付きピーク探索 (PSD × m²) の検証用。条件列は膜厚 [μm]。
 
 各データには真値を記した *_truth.csv を併せて出力する。
 
@@ -193,6 +198,118 @@ def make_film(wl_min: float = 700.0, wl_max: float = 1000.0,
 
 
 # ---------------------------------------------------------------------------
+# 4. 分散のある膜 (有効屈折率・式 8・反射率モデルの検証用)
+# ---------------------------------------------------------------------------
+
+def single_layer_reflectance(wl: np.ndarray, d: float, n_film: np.ndarray,
+                             n_sub: complex) -> np.ndarray:
+    """特性行列法で単層膜の反射率を計算する.
+
+    ir_ft_analysis.layer_reflectance (Airy の式) とは別の導出で計算し、
+    解析側のモデル式に誤りがあれば検出できるようにしている。
+    屈折率は N = n - ik の符号で与える。
+    """
+    delta = 2.0 * np.pi * n_film * d / wl
+    cos_d, sin_d = np.cos(delta), np.sin(delta)
+    # [B, C]ᵀ = [[cos δ, i sin δ / η1], [i η1 sin δ, cos δ]] [1, η2]ᵀ
+    b = cos_d + 1j * sin_d * n_sub / n_film
+    c = 1j * n_film * sin_d + cos_d * n_sub
+    r = (b - c) / (b + c)                          # 入射側は空気 (η0 = 1)
+    return np.abs(r) ** 2
+
+
+def make_dispersion(wl_min: float = 400.0, wl_max: float = 1000.0,
+                    d_lambda: float = 0.25,
+                    thickness_um: tuple[float, ...] = (2, 5, 10, 20, 30, 40, 50),
+                    cauchy: tuple[float, float] = (1.56, 0.005),
+                    substrate_n: float = 3.6, noise: float = 3e-4,
+                    seed: int = 4) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """屈折率に分散がある高分子膜を Si 基板に載せたときの反射率.
+
+    膜の屈折率は Cauchy の式 n(λ) = A + B/λ² (λ: µm) で与える。多重反射を
+    含む厳密な反射率で、倍率やオフセットは加えない。帯域が広く分散が強いので、
+    一定の屈折率で膜厚を求めると数 % ずれ、厚い膜では FFT のピークも広がる。
+    """
+    rng = np.random.default_rng(seed)
+    wl = np.arange(wl_min, wl_max + d_lambda / 2, d_lambda)
+    a, b = cauchy
+    n_film = a + b / (wl / 1000.0) ** 2
+    s1, s2 = 1.0 / wl_min, 1.0 / wl_max
+    n1, n2 = n_film[0], n_film[-1]
+    n_eff = (n1 * s1 - n2 * s2) / (s1 - s2)       # 論文の式 7
+    n_center = a + b / (0.5 * (wl_min + wl_max) / 1000.0) ** 2
+
+    data = {"Wavelength (nm)": wl}
+    truth = []
+    for d_um in thickness_um:
+        d_nm = d_um * 1000.0
+        refl = single_layer_reflectance(wl, d_nm, n_film.astype(complex),
+                                        complex(substrate_n))
+        data[str(d_um)] = refl + (rng.normal(0.0, noise, wl.size) if noise else 0.0)
+        truth.append({
+            "condition_thickness_um": d_um,
+            "true_thickness_nm": d_nm,
+            "effective_opd_nm": 2.0 * n_eff * d_nm,
+            "thickness_if_constant_n_center_nm": 2.0 * n_eff * d_nm / (2.0 * n_center),
+        })
+
+    meta = {
+        "kind": "dispersion",
+        "delta_lambda_nm": d_lambda,
+        "film_cauchy_A_B_um2": [a, b],
+        "substrate_n": substrate_n,
+        "n_at_band_edges": [float(n1), float(n2)],
+        "n_at_band_center": float(n_center),
+        "n_eff_full_band": float(n_eff),
+        "constant_n_bias_percent": float((n_eff / n_center - 1.0) * 100.0),
+        "noise_sigma": noise,
+        "note": ("条件列は膜厚 [μm]。一定の屈折率 (帯域中央の値) で求めると膜厚が "
+                 "n_eff / n_center だけずれる。--cauchy 1.56,0.005 --substrate-n 3.6 で解析する。"),
+    }
+    return pd.DataFrame(data), pd.DataFrame(truth), meta
+
+
+# ---------------------------------------------------------------------------
+# 5. 強いベースラインの上の弱い縞 (重み付きピーク探索の検証用)
+# ---------------------------------------------------------------------------
+
+def make_background(wl_min: float = 500.0, wl_max: float = 1000.0,
+                    d_lambda: float = 0.25,
+                    thickness_um: tuple[float, ...] = (20, 40, 60, 80, 100),
+                    refractive_index: float = 1.5, amp: float = 0.02,
+                    noise: float = 5e-4, seed: int = 5
+                    ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """光源スペクトルや吸収端のような強い山形のベースラインに、弱い縞が乗ったデータ.
+
+    1 次のデトレンドでは山形を取りきれず、その残りが低い位置に大きなピークを
+    作る。振幅最大のピークを探すと縞ではなくこちらを拾ってしまう。
+    パワースペクトルに番号の 2 乗を掛けると (論文の第 4 章)、高い位置にある
+    縞のピークが強調されて正しく検出できる。
+    """
+    rng = np.random.default_rng(seed)
+    wl = np.arange(wl_min, wl_max + d_lambda / 2, d_lambda)
+    background = (0.30 + 0.12 * np.exp(-((wl - 650.0) / 60.0) ** 2)
+                  + 0.05 * ((wl - 750.0) / 250.0) ** 2)
+    data = {"Wavelength (nm)": wl}
+    truth = []
+    for d_um in thickness_um:
+        opd = 2.0 * refractive_index * d_um * 1000.0
+        y = background + amp * np.cos(2.0 * np.pi * opd / wl + PHASE)
+        data[str(d_um)] = _add_noise(y, amp, amp / noise, rng)
+        truth.append({"condition_thickness_um": d_um, "true_opd_nm": opd,
+                      "true_amplitude": amp})
+    meta = {
+        "kind": "background",
+        "delta_lambda_nm": d_lambda,
+        "refractive_index": refractive_index,
+        "fringe_amplitude": amp,
+        "note": ("山形のベースライン (振幅 0.12) の上に振幅 0.02 の縞が乗る。"
+                 "波数ドメインで --peak-weight m2 を付けると縞のピークを検出できる。"),
+    }
+    return pd.DataFrame(data), pd.DataFrame(truth), meta
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -200,6 +317,8 @@ GENERATORS = {
     "highfreq": (make_highfreq, "dataset_highfreq"),
     "alias": (make_alias, "dataset_alias"),
     "film": (make_film, "dataset_film"),
+    "dispersion": (make_dispersion, "dataset_dispersion"),
+    "background": (make_background, "dataset_background"),
 }
 
 

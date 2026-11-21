@@ -1,0 +1,18 @@
+{
+  "kind": "dispersion",
+  "delta_lambda_nm": 0.25,
+  "film_cauchy_A_B_um2": [
+    1.56,
+    0.005
+  ],
+  "substrate_n": 3.6,
+  "n_at_band_edges": [
+    1.59125,
+    1.565
+  ],
+  "n_at_band_center": 1.570204081632653,
+  "n_eff_full_band": 1.60875,
+  "constant_n_bias_percent": 2.4548349363139987,
+  "noise_sigma": 0.0003,
+  "note": "条件列は膜厚 [μm]。一定の屈折率 (帯域中央の値) で求めると膜厚が n_eff / n_center だけずれる。--cauchy 1.56,0.005 --substrate-n 3.6 で解析する。"
+}

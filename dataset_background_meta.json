@@ -1,0 +1,7 @@
+{
+  "kind": "background",
+  "delta_lambda_nm": 0.25,
+  "refractive_index": 1.5,
+  "fringe_amplitude": 0.02,
+  "note": "山形のベースライン (振幅 0.12) の上に振幅 0.02 の縞が乗る。波数ドメインで --peak-weight m2 を付けると縞のピークを検出できる。"
+}

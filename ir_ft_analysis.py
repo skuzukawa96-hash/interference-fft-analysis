@@ -23,6 +23,11 @@
     8. FFT ピークの精密化 (--fit grid / lm)。FFT 結果の近傍をグリッドサーチし、
        その最良点を初期値に Levenberg-Marquardt 法で非線形回帰する
        (M. Quinten, SN Applied Sciences 1, 823 (2019) 第 5 章の手法)
+    9. 同論文のその他の手法
+       - PSD に番号の 2 乗を掛けた重み付きピーク探索 (--peak-weight m2, 第 4 章)
+       - 屈折率の分散を考慮した有効屈折率と最小膜厚 (式 6, 7)
+       - 隣接する極大の位置から膜厚を求める方法 (--fringe, 式 8)
+       - 多重反射の反射率モデルによるフィット (--fit-model reflectance, 式 1, 15)
 
 使用ライブラリ: 標準ライブラリ, numpy, pandas, matplotlib, seaborn, scikit-learn
 
@@ -140,6 +145,142 @@ def resolve_domain(name: str) -> DomainInfo:
 
 
 # ---------------------------------------------------------------------------
+# 屈折率モデル
+# ---------------------------------------------------------------------------
+#
+# 複素屈折率は N = n - i k の符号で扱う (k > 0 が吸収)。反射率モデルで
+# 位相因子を exp(-i 4π N d / λ) と書くと、この符号で振幅が exp(-4π k d / λ)
+# に減衰し、論文の式 (16) の E と一致する。
+
+@dataclass
+class RefractiveIndex:
+    """波長 λ [nm] の関数としての複素屈折率 N(λ) = n(λ) - i k(λ)."""
+
+    kind: str                                   # "constant" / "cauchy" / "table"
+    description: str                            # 表示用の説明
+    func: Callable[[np.ndarray], np.ndarray]    # λ [nm] -> 複素屈折率
+    wl_range: tuple[float, float] | None = None # テーブルの有効範囲 [nm]
+
+    def __call__(self, wl: np.ndarray | float) -> np.ndarray:
+        wl = np.asarray(wl, dtype=float)
+        if self.wl_range is not None:
+            lo, hi = self.wl_range
+            if wl.min() < lo - 1e-9 or wl.max() > hi + 1e-9:
+                raise ValueError(
+                    f"屈折率テーブルの範囲 {lo:g}-{hi:g} nm の外の波長 "
+                    f"({wl.min():g}-{wl.max():g} nm) が必要です。解析帯域を狭めてください。")
+        return np.asarray(self.func(wl), dtype=complex)
+
+    def n(self, wl: np.ndarray | float) -> np.ndarray:
+        """屈折率の実部 n(λ)."""
+        return np.real(self(wl))
+
+    def k(self, wl: np.ndarray | float) -> np.ndarray:
+        """消衰係数 k(λ) (吸収がなければ 0)."""
+        return -np.imag(self(wl))
+
+
+def constant_index(n: float, k: float = 0.0) -> RefractiveIndex:
+    """波長によらない一定の屈折率."""
+    value = complex(float(n), -float(k))
+    desc = f"一定 n = {n:g}" + (f", k = {k:g}" if k else "")
+    return RefractiveIndex("constant", desc,
+                           lambda wl: np.full(np.shape(wl), value, dtype=complex))
+
+
+def cauchy_index(coeffs: Sequence[float]) -> RefractiveIndex:
+    """Cauchy の分散式 n(λ) = A + B/λ² + C/λ⁴ (λ は µm)."""
+    c = [float(v) for v in coeffs]
+    if not 1 <= len(c) <= 3:
+        raise ValueError("Cauchy の係数は A[,B[,C]] の 1〜3 個で指定してください。")
+    c += [0.0] * (3 - len(c))
+    a, b, cc = c
+
+    def func(wl: np.ndarray) -> np.ndarray:
+        um2 = (np.asarray(wl, dtype=float) / 1000.0) ** 2
+        return (a + b / um2 + cc / um2 ** 2).astype(complex)
+
+    desc = f"Cauchy n = {a:g} + {b:g}/λ² + {cc:g}/λ⁴ (λ: µm)"
+    return RefractiveIndex("cauchy", desc, func)
+
+
+def table_index(path: str | Path) -> RefractiveIndex:
+    """CSV の屈折率テーブル (1 列目: 波長 nm, 2 列目: n, 3 列目: k [任意]).
+
+    refractiveindex.info などから取得したデータを想定し、テーブルの点の間は
+    線形補間する。
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"屈折率テーブルが見つかりません: {path}")
+    df = pd.read_csv(path, encoding="utf-8-sig")
+    if df.shape[1] < 2:
+        raise ValueError("屈折率テーブルには波長 [nm] と n の 2 列以上が必要です。")
+    df = df.apply(pd.to_numeric, errors="coerce").dropna(subset=df.columns[:2])
+    df = df.sort_values(df.columns[0])
+    wl = df.iloc[:, 0].to_numpy(dtype=float)
+    n = df.iloc[:, 1].to_numpy(dtype=float)
+    k = (df.iloc[:, 2].fillna(0.0).to_numpy(dtype=float)
+         if df.shape[1] >= 3 else np.zeros_like(n))
+    if wl.size < 2:
+        raise ValueError("屈折率テーブルの有効な行が 2 行未満です。")
+
+    def func(x: np.ndarray) -> np.ndarray:
+        return np.interp(x, wl, n) - 1j * np.interp(x, wl, k)
+
+    return RefractiveIndex("table", f"テーブル {path.name} ({wl[0]:g}-{wl[-1]:g} nm)",
+                           func, wl_range=(float(wl[0]), float(wl[-1])))
+
+
+def as_index(value: "RefractiveIndex | float | None") -> RefractiveIndex | None:
+    """数値なら一定の屈折率に変換し、モデルならそのまま返す."""
+    if value is None or isinstance(value, RefractiveIndex):
+        return value
+    return constant_index(float(value))
+
+
+def effective_index(index: RefractiveIndex, wl_min: float, wl_max: float) -> float:
+    """分散を考慮した有効屈折率 (論文の式 7).
+
+        n_eff = (n(λmin)/λmin - n(λmax)/λmax) / (1/λmin - 1/λmax)
+
+    干渉の位相は 4π n(λ) d / λ なので、帯域の両端の位相差は
+    4π d (n(λmin)/λmin - n(λmax)/λmax) になる。1/λ に対する FFT はこれを
+    一定の屈折率 n_eff の膜とみなして光路差 2 n_eff d を返す。
+    一定の屈折率なら n_eff = n。
+    """
+    n1, n2 = index.n(np.array([wl_min, wl_max]))
+    return float((n1 / wl_min - n2 / wl_max) / (1.0 / wl_min - 1.0 / wl_max))
+
+
+def group_index_range(index: RefractiveIndex, wl_min: float, wl_max: float,
+                      samples: int = 512) -> tuple[float, float]:
+    """帯域内の群屈折率 n_g = d(n/λ)/d(1/λ) = n - λ dn/dλ の最小値と最大値.
+
+    1/λ に対する縞の局所的な間隔は 1/(2 n_g d) で決まる。帯域内で n_g が
+    変わると縞の間隔が変わり、FFT のピークが広がる (論文の第 4 章)。
+    """
+    wl = np.linspace(wl_min, wl_max, samples)
+    sigma = 1.0 / wl
+    ng = np.gradient(index.n(wl) * sigma, sigma)
+    return float(ng.min()), float(ng.max())
+
+
+def parse_cauchy(text: str) -> list[float]:
+    """'1.56,0.005' や '1.56 0.005 0' を Cauchy 係数のリストに変換する."""
+    parts = [p for p in str(text).replace(",", " ").split() if p]
+    try:
+        coeffs = [float(p) for p in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Cauchy の係数は 'A,B[,C]' の数値で指定してください: {text!r}") from exc
+    if not 1 <= len(coeffs) <= 3:
+        raise argparse.ArgumentTypeError(
+            f"Cauchy の係数は 1〜3 個で指定してください: {text!r}")
+    return coeffs
+
+
+# ---------------------------------------------------------------------------
 # 窓関数
 # ---------------------------------------------------------------------------
 
@@ -254,11 +395,33 @@ class FitResult:
     x_center: float = 0.0             # 座標正規化の中心
     half_width: float = 1.0           # 座標正規化の半幅
     degree: int = 1                   # ベースライン多項式の次数
+    model_name: str = "sinusoid"      # "sinusoid" または "reflectance"
+    thickness: float | None = None    # 膜厚 [nm] (屈折率が与えられたとき)
+    thickness_stderr: float | None = None
+    scale: float | None = None        # 反射率モデルの倍率 (理想は 1)
+    grid_points_used: int = 0         # 実際に調べたグリッド点の数
+    predict: Callable[[np.ndarray], np.ndarray] | None = field(default=None, repr=False)
 
     def evaluate(self, x: np.ndarray) -> np.ndarray:
         """任意の独立変数でフィット後のモデル値を計算する (作図用)."""
+        if self.predict is not None:
+            return self.predict(np.asarray(x, dtype=float))
         u = (np.asarray(x, dtype=float) - self.x_center) / self.half_width
         return _sinusoid_design(u, self.params[0], self.degree) @ self.params[1:]
+
+
+@dataclass
+class FringeResult:
+    """隣接する極大の位置から求めた膜厚 (論文の式 8)."""
+
+    thickness: float                  # 各ペアの膜厚の平均 [nm]
+    sem: float                        # 平均の標準誤差 [nm]
+    std: float                        # 各ペアのばらつき (標準偏差) [nm]
+    pairs: int                        # 使った隣接極大のペア数
+    points_per_fringe: float          # 縞 1 周期あたりのデータ点数
+    reliable: bool                    # 点数が十分で信頼できるか
+    maxima_wavelengths: np.ndarray = field(repr=False, default_factory=lambda: np.zeros(0))
+    per_pair: np.ndarray = field(repr=False, default_factory=lambda: np.zeros(0))
 
 
 @dataclass
@@ -273,6 +436,7 @@ class ColumnFFTResult:
     peak_amplitude: float
     peak_index: int
     fit: FitResult | None = None      # 精密化した場合の結果
+    fringe: FringeResult | None = None  # 式 8 による膜厚 (--fringe のとき)
 
     @property
     def estimate(self) -> float:
@@ -316,6 +480,13 @@ class BandAnalysis:
     interp: str = "cubic"              # グリッド再配置に使った補間方式
     fit_method: str = "none"           # 精密化の方式 (none / grid / lm)
     grid_points: int = 0               # グリッドサーチの分割数 M
+    peak_weight: str = "none"          # ピーク探索の重み (none / m2)
+    fit_model: str = "sinusoid"        # 精密化のモデル (sinusoid / reflectance)
+    index: RefractiveIndex | None = None      # 膜の屈折率モデル
+    substrate: RefractiveIndex | None = None  # 基板の屈折率モデル
+    n_band: tuple[float, float] | None = None # 帯域両端の屈折率 n(λmin), n(λmax)
+    n_eff: float | None = None                # 有効屈折率 (式 7)
+    group_index: tuple[float, float] | None = None  # 帯域内の群屈折率の範囲
     results: list[ColumnFFTResult] = field(default_factory=list)
     regression: RegressionResult | None = None
 
@@ -323,6 +494,16 @@ class BandAnalysis:
     def label(self) -> str:
         lo, hi = self.band
         return f"band_{lo:g}-{hi:g}nm_{self.domain.suffix}"
+
+    @property
+    def thickness_resolution(self) -> float | None:
+        """膜厚の分解能 d_min = 光路差の分解能 / (2 n_eff) (論文の式 6)."""
+        return None if self.n_eff is None else self.resolution / (2.0 * self.n_eff)
+
+    @property
+    def thickness_max(self) -> float | None:
+        """FFT で求められる最大膜厚 = ナイキスト限界 / (2 n_eff)."""
+        return None if self.n_eff is None else self.nyquist / (2.0 * self.n_eff)
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +770,12 @@ def fourier_transform(grid: np.ndarray, y: np.ndarray, window: str = "hann",
 
 FIT_METHODS = ("none", "grid", "lm")
 
+#: 精密化に使うモデル
+FIT_MODELS = ("sinusoid", "reflectance")
+
+#: ピーク探索の重み (論文の第 4 章)
+PEAK_WEIGHTS = ("none", "m2")
+
 #: グリッドサーチの既定の分割数 M (論文の推奨値)
 DEFAULT_GRID_POINTS = 16
 
@@ -652,19 +839,11 @@ def grid_search(u: np.ndarray, y: np.ndarray, g0: float, dg: float,
     return gs, chi2, int(np.argmin(chi2))
 
 
-def levenberg_marquardt(u: np.ndarray, y: np.ndarray, p0: np.ndarray,
-                        degree: int, max_iter: int = 100,
-                        ftol: float = 1e-12, xtol: float = 1e-12
-                        ) -> tuple[np.ndarray, float, np.ndarray, int, bool]:
-    """Levenberg-Marquardt 法で正弦波 + ベースラインを非線形フィットする (手順 2).
+def _sinusoid_evaluator(u: np.ndarray, degree: int
+                        ) -> Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]]:
+    """正弦波 + ベースラインのモデル値とヤコビアンを返す関数を作る.
 
     パラメータ p = [g, b_0, ..., b_deg, A_c, A_s]。
-    各反復で (JᵀJ + λ·diag(JᵀJ)) δ = Jᵀr を解いて p を更新する。
-    λ が小さいとガウス・ニュートン法 (速いが初期値が悪いと発散しやすい)、
-    大きいと最急降下法 (遅いが確実に下る) に近づく。χ² が下がれば λ を
-    1/10 にして大胆に、下がらなければ 10 倍にして慎重に進む。
-
-    戻り値は (最終パラメータ, χ², ヤコビアン, 反復回数, 収束したか)。
     """
     powers = np.column_stack([u ** k for k in range(degree + 1)])
     i_c, i_s = degree + 2, degree + 3
@@ -680,6 +859,26 @@ def levenberg_marquardt(u: np.ndarray, y: np.ndarray, p0: np.ndarray,
         jac[:, i_s] = s                                              # ∂y/∂A_s
         return model, jac
 
+    return evaluate
+
+
+def levenberg_marquardt(y: np.ndarray,
+                        evaluate: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]],
+                        p0: np.ndarray, max_iter: int = 100,
+                        ftol: float = 1e-12, xtol: float = 1e-12
+                        ) -> tuple[np.ndarray, float, np.ndarray, int, bool]:
+    """Levenberg-Marquardt 法による非線形最小二乗フィット (論文の手順 2).
+
+    evaluate(p) はモデル値とヤコビアン (各パラメータでの偏微分) を返す関数。
+    正弦波モデルと反射率モデルの両方でこの関数を共用している。
+
+    各反復で (JᵀJ + λ·diag(JᵀJ)) δ = Jᵀr を解いて p を更新する。
+    λ が小さいとガウス・ニュートン法 (速いが初期値が悪いと発散しやすい)、
+    大きいと最急降下法 (遅いが確実に下る) に近づく。χ² が下がれば λ を
+    1/10 にして大胆に、下がらなければ 10 倍にして慎重に進む。
+
+    戻り値は (最終パラメータ, χ², ヤコビアン, 反復回数, 収束したか)。
+    """
     p = np.asarray(p0, dtype=float).copy()
     model, jac = evaluate(p)
     resid = y - model
@@ -745,7 +944,7 @@ def refine_peak_fit(x: np.ndarray, y: np.ndarray, fft_peak: float,
     iterations, converged, stderr, note = 0, True, None, ""
     if method == "lm":
         p_lm, chi2_lm, jac, iterations, converged = levenberg_marquardt(
-            u, y, params, degree, max_iter=max_iter)
+            y, _sinusoid_evaluator(u, degree), params, max_iter=max_iter)
         # 探索範囲から大きく外れたら、別の谷に落ちたとみなして採用しない
         if p_lm[0] <= 0.0 or abs(p_lm[0] - g0) > (GRID_HALF_WIDTH + 0.5) * dg:
             converged = False
@@ -786,7 +985,262 @@ def refine_peak_fit(x: np.ndarray, y: np.ndarray, fft_peak: float,
         x_center=float(x_c),
         half_width=float(half),
         degree=int(degree),
+        grid_points_used=int(gs.size),
     )
+
+
+# ---------------------------------------------------------------------------
+# 多重反射の反射率モデル (論文の式 1, 15)
+# ---------------------------------------------------------------------------
+
+def layer_reflectance(wl: np.ndarray, d: float, n_film: np.ndarray,
+                      n_sub: np.ndarray, n_amb: complex = 1.0
+                      ) -> tuple[np.ndarray, np.ndarray]:
+    """基板上の単層膜の反射率と、その膜厚 d による微分を返す.
+
+    多重反射をすべて足し合わせた振幅反射率 (Airy の式):
+
+        r = (r01 + r12 E) / (1 + r01 r12 E),   E = exp(-i 4π N d / λ)
+        r01 = (N0 - N) / (N0 + N),   r12 = (N - Ns) / (N + Ns)
+
+    反射率は R = |r|²。屈折率が実数なら論文の式 (1) と一致し、
+    吸収 (N = n - ik) があれば E の大きさが exp(-4π k d / λ) となって
+    式 (15), (16) と一致する。式 (1) は √(R01 R12) を使うため r01 r12 の
+    符号 (反射時の位相反転) を区別できないが、ここでは符号付きで扱う。
+    """
+    wl = np.asarray(wl, dtype=float)
+    r01 = (n_amb - n_film) / (n_amb + n_film)
+    r12 = (n_film - n_sub) / (n_film + n_sub)
+    rate = 4.0 * np.pi * n_film / wl                # 位相の膜厚微分 (複素)
+    e = np.exp(-1j * rate * d)
+    den = 1.0 + r01 * r12 * e
+    r = (r01 + r12 * e) / den
+    dr_dd = r12 * (1.0 - r01 ** 2) / den ** 2 * (-1j * rate * e)
+    reflectance = np.abs(r) ** 2
+    d_reflectance = 2.0 * np.real(np.conj(r) * dr_dd)
+    return reflectance, d_reflectance
+
+
+def refine_reflectance_fit(x: np.ndarray, y: np.ndarray, d_start: float,
+                           d_min: float, index: RefractiveIndex,
+                           substrate: RefractiveIndex, n_eff: float,
+                           method: str = "lm", degree: int = 0,
+                           n_grid: int = DEFAULT_GRID_POINTS, max_iter: int = 100,
+                           d_margin: float = 0.0) -> FitResult:
+    """反射率モデルでグリッドサーチと LM 法を行い、膜厚を直接求める.
+
+    論文の第 5 章の手順そのもの。x は 1/λ [1/nm]、d_start は FFT から求めた
+    膜厚 (光路差 / 2 n_eff)、d_min は膜厚の分解能 (式 6)。
+
+    測定値 ≈ s × R(λ; d) + ベースライン多項式 とし、倍率 s とベースラインは
+    線形パラメータとして最小二乗で消去する。s は参照試料の校正のずれや、
+    パターン付き試料で膜が占める面積の割合 (論文の式 9) を吸収する。
+
+    モデルは位相 4π n d / λ の絶対値まで使うため、χ² は膜厚に対して
+    λ/(2n) 程度の間隔で細かい谷が並ぶ。論文の M = 16 では刻みが粗すぎて
+    隣の谷に落ちることがあるので、刻みが λmin / (8 n) 以下になるよう
+    グリッドを自動で細かくする。屈折率の分散で FFT のピークがずれる分は
+    d_margin として探索範囲に足す。
+    """
+    if method not in ("grid", "lm"):
+        raise ValueError(f"未知の精密化方式: {method!r} (grid/lm)")
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    wl = 1.0 / x
+    n_film = index(wl)
+    n_sub = substrate(wl)
+    x_c = 0.5 * (x.min() + x.max())
+    half = 0.5 * (x.max() - x.min())
+    u = (x - x_c) / half
+    powers = np.column_stack([u ** k for k in range(degree + 1)])
+
+    def solve(d: float) -> tuple[np.ndarray, float, np.ndarray]:
+        refl, _ = layer_reflectance(wl, d, n_film, n_sub)
+        design = np.column_stack([refl, powers])
+        coef, *_ = np.linalg.lstsq(design, y, rcond=None)
+        resid = y - design @ coef
+        return coef, float(resid @ resid), refl
+
+    # --- 手順 1: グリッドサーチ --------------------------------------------
+    half_range = GRID_HALF_WIDTH * d_min + d_margin
+    step_target = float(wl.min() / (8.0 * np.real(n_film).max()))
+    n_pts = max(int(n_grid), int(np.ceil(2.0 * half_range / step_target)))
+    ds = d_start + np.linspace(-half_range, half_range, n_pts + 1)
+    ds = ds[ds > 0.0]
+    if ds.size == 0:
+        raise ValueError("反射率モデルの探索範囲が空です。")
+    chi2s = np.array([solve(d)[1] for d in ds])
+    k = int(np.argmin(chi2s))
+    d_grid = float(ds[k])
+    coef, chi2, _ = solve(d_grid)
+    d_best = d_grid
+    params = np.concatenate([[1.0], coef])      # 膜厚は d_grid に対する比で持つ
+
+    iterations, converged, stderr_d, note = 0, True, None, ""
+    if method == "lm":
+        def evaluate(p: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            refl, drefl = layer_reflectance(wl, p[0] * d_grid, n_film, n_sub)
+            model = p[1] * refl + powers @ p[2:]
+            jac = np.empty((y.size, p.size))
+            jac[:, 0] = p[1] * drefl * d_grid          # ∂y/∂(d/d_grid)
+            jac[:, 1] = refl                           # ∂y/∂s
+            jac[:, 2:] = powers                        # ∂y/∂b_k
+            return model, jac
+
+        p_lm, chi2_lm, jac, iterations, converged = levenberg_marquardt(
+            y, evaluate, params, max_iter=max_iter)
+        d_lm = float(p_lm[0] * d_grid)
+        if d_lm <= 0.0 or abs(d_lm - d_start) > half_range + 2.0 * step_target:
+            converged = False
+            note = "LM 法が探索範囲の外へ移動したため、グリッドサーチの結果を採用"
+        else:
+            params, chi2, d_best = p_lm, chi2_lm, d_lm
+            dof = max(y.size - params.size, 1)
+            try:
+                cov = np.linalg.inv(jac.T @ jac) * (chi2 / dof)
+                stderr_d = float(np.sqrt(max(cov[0, 0], 0.0))) * d_grid
+            except np.linalg.LinAlgError:
+                stderr_d = float("nan")
+            if not converged:
+                note = f"LM 法が {max_iter} 回で収束しなかった"
+
+    scale = float(params[1])
+    base = params[2:].copy()
+    refl_best, _ = layer_reflectance(wl, d_best, n_film, n_sub)
+    model = scale * refl_best + powers @ base
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    if scale < 0.0:
+        note = (note + "; " if note else "") + (
+            "倍率が負: 基板や膜の屈折率の大小関係が実際と逆の可能性")
+
+    def predict(xq: np.ndarray, _d: float = d_best) -> np.ndarray:
+        wq = 1.0 / np.asarray(xq, dtype=float)
+        uq = (np.asarray(xq, dtype=float) - x_c) / half
+        rq, _ = layer_reflectance(wq, _d, index(wq), substrate(wq))
+        return scale * rq + np.column_stack([uq ** j for j in range(degree + 1)]) @ base
+
+    opd = 2.0 * n_eff
+    return FitResult(
+        method=method,
+        fft_frequency=opd * float(d_start),
+        grid_frequency=opd * d_grid,
+        frequency=opd * d_best,
+        stderr=None if stderr_d is None else opd * stderr_d,
+        amplitude=0.5 * float(np.ptp(scale * refl_best)),
+        phase=float("nan"),
+        rmse=float(np.sqrt(chi2 / y.size)),
+        r2=1.0 - chi2 / ss_tot if ss_tot > 0 else float("nan"),
+        iterations=int(iterations),
+        converged=bool(converged),
+        note=note,
+        grid_frequencies=opd * ds,
+        grid_chi2=chi2s,
+        x=x,
+        y=y,
+        model=model,
+        params=np.asarray(params, dtype=float),
+        x_center=float(x_c),
+        half_width=float(half),
+        degree=int(degree),
+        model_name="reflectance",
+        thickness=d_best,
+        thickness_stderr=stderr_d,
+        scale=scale,
+        grid_points_used=int(ds.size),
+        predict=predict,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 隣接する極大から膜厚を求める (論文の式 8)
+# ---------------------------------------------------------------------------
+
+#: 式 8 の結果を信頼できるとみなす、縞 1 周期あたりの最小データ点数
+FRINGE_MIN_POINTS = 4.0
+
+
+def _parabola_vertex(x3: np.ndarray, y3: np.ndarray) -> float:
+    """不等間隔の 3 点を通る放物線の頂点の x 座標."""
+    (x0, x1, x2), (y0, y1, y2) = x3, y3
+    denom = (x0 - x1) * (x0 - x2) * (x1 - x2)
+    a = (x2 * (y1 - y0) + x1 * (y0 - y2) + x0 * (y2 - y1)) / denom
+    b = (x2 ** 2 * (y0 - y1) + x1 ** 2 * (y2 - y0) + x0 ** 2 * (y1 - y2)) / denom
+    if a >= 0.0:                                   # 上に凸でなければ中央の点
+        return float(x1)
+    return float(np.clip(-b / (2.0 * a), x0, x2))
+
+
+def fringe_thickness(wl: np.ndarray, y: np.ndarray, index: RefractiveIndex,
+                     opd_hint: float) -> FringeResult | None:
+    """隣接する反射率の極大の位置から膜厚を求める (論文の式 8).
+
+        d = 1 / (2 (n(λ1)/λ1 - n(λ2)/λ2))     λ1 < λ2 は隣り合う極大の波長
+
+    隣り合う極大のあいだで位相 4π n d / λ がちょうど 2π 変わることを使う。
+    FFT と違って各点で屈折率 n(λ) をそのまま使うので、分散が強くて FFT が
+    使えないときの代わりになる。1 組だけでは誤差が大きいので、帯域内の
+    すべての隣接ペアについて求めて平均する。opd_hint (FFT の光路差) は
+    極大を探すときの目安の間隔にだけ使う。
+    """
+    if opd_hint <= 0.0:
+        return None
+    sigma = 1.0 / np.asarray(wl, dtype=float)
+    order = np.argsort(sigma)
+    sigma, yy = sigma[order], np.asarray(y, dtype=float)[order]
+
+    # 緩やかなベースラインを 2 次式で除いてから極大を探す
+    u = (sigma - sigma.mean()) / (0.5 * np.ptp(sigma))
+    yd = yy - np.polyval(np.polyfit(u, yy, 2), u)
+
+    period = 1.0 / opd_hint                        # 1/λ での縞の間隔の目安
+    points = period / float(np.median(np.diff(sigma)))
+    cand = np.where((yd[1:-1] > yd[:-2]) & (yd[1:-1] >= yd[2:]) & (yd[1:-1] > 0.0))[0] + 1
+
+    # 目安の間隔の 6 割より近い極大は、高い方だけを残す (ノイズによる偽の極大を除く)
+    kept: list[int] = []
+    for i in cand[np.argsort(-yd[cand])]:
+        if all(abs(sigma[i] - sigma[j]) >= 0.6 * period for j in kept):
+            kept.append(int(i))
+    kept.sort()
+    if len(kept) < 2:
+        return None
+    peaks = np.array([_parabola_vertex(sigma[i - 1:i + 2], yd[i - 1:i + 2]) for i in kept])
+
+    d_pairs = []
+    for s_lo, s_hi in zip(peaks[:-1], peaks[1:]):
+        gap = s_hi - s_lo
+        if not 0.6 * period <= gap <= 1.6 * period:  # 極大の取りこぼしがある区間は使わない
+            continue
+        n_lo, n_hi = index.n(np.array([1.0 / s_lo, 1.0 / s_hi]))
+        d_pairs.append(1.0 / (2.0 * (n_hi * s_hi - n_lo * s_lo)))
+    if not d_pairs:
+        return None
+    d_pairs = np.asarray(d_pairs)
+    std = float(np.std(d_pairs, ddof=1)) if d_pairs.size > 1 else float("nan")
+    return FringeResult(
+        thickness=float(d_pairs.mean()),
+        sem=std / np.sqrt(d_pairs.size) if d_pairs.size > 1 else float("nan"),
+        std=std,
+        pairs=int(d_pairs.size),
+        points_per_fringe=float(points),
+        reliable=bool(points >= FRINGE_MIN_POINTS and d_pairs.size >= 3),
+        maxima_wavelengths=1.0 / peaks[::-1],
+        per_pair=d_pairs,
+    )
+
+
+def _climb_to_local_max(amp: np.ndarray, idx: int, allowed: np.ndarray) -> int:
+    """振幅が増える方向へ隣の点をたどり、最寄りの極大に移る."""
+    while True:
+        left = idx - 1 if idx - 1 >= 0 and allowed[idx - 1] else None
+        right = idx + 1 if idx + 1 < amp.size and allowed[idx + 1] else None
+        best = idx
+        for j in (left, right):
+            if j is not None and amp[j] > amp[best]:
+                best = j
+        if best == idx:
+            return idx
+        idx = best
 
 
 def analyze_band(spec: SpectrumData, lo: float, hi: float, window: str = "hann",
@@ -797,16 +1251,48 @@ def analyze_band(spec: SpectrumData, lo: float, hi: float, window: str = "hann",
                  interp: str = "cubic", fit: str = "none",
                  grid_points: int = DEFAULT_GRID_POINTS,
                  max_iter: int = 100,
-                 baseline_degree: int | None = None) -> BandAnalysis:
+                 baseline_degree: int | None = None,
+                 peak_weight: str = "none",
+                 index: RefractiveIndex | float | None = None,
+                 substrate: RefractiveIndex | float | None = None,
+                 fit_model: str = "sinusoid",
+                 fringe: bool = False) -> BandAnalysis:
     """指定帯域・指定ドメインで全条件列の FFT とピーク抽出を行う.
 
     fit が "grid" または "lm" なら、FFT のピークを出発点に精密化も行う。
     baseline_degree はフィットのベースライン多項式の次数で、None なら
     デトレンド方式に合わせる (linear なら 1 次、それ以外は 0 次)。
+
+    peak_weight="m2" なら、パワースペクトルに番号の 2 乗を掛けて
+    ピークを探す (論文の第 4 章)。
+
+    以下は波数ドメインで膜の屈折率 index を与えたときだけ有効:
+      - 有効屈折率 n_eff (式 7) と膜厚の分解能 d_min (式 6) を求める
+      - fit_model="reflectance" なら多重反射の反射率モデルで膜厚をフィットする
+        (式 1, 15)。substrate は基板の屈折率 (既定 1.0 = 自立膜)
+      - fringe=True なら隣接する極大の位置から膜厚を求める (式 8)
     """
     if fit not in FIT_METHODS:
         raise ValueError(f"未知の精密化方式: {fit!r} ({'/'.join(FIT_METHODS)})")
+    if peak_weight not in PEAK_WEIGHTS:
+        raise ValueError(f"未知の重み: {peak_weight!r} ({'/'.join(PEAK_WEIGHTS)})")
+    if fit_model not in FIT_MODELS:
+        raise ValueError(f"未知のモデル: {fit_model!r} ({'/'.join(FIT_MODELS)})")
     dom = domain if isinstance(domain, DomainInfo) else resolve_domain(domain)
+    index = as_index(index)
+    substrate = as_index(substrate)
+    if fit_model == "reflectance":
+        if dom.key != "wavenumber":
+            raise ValueError("反射率モデルは波数ドメイン (--domain wavenumber) でのみ使えます。")
+        if index is None:
+            raise ValueError("反射率モデルには膜の屈折率 (-n / --cauchy / --n-table) が必要です。")
+        if fit == "none":
+            raise ValueError("反射率モデルを使うには --fit grid または lm を指定してください。")
+        if substrate is None:
+            substrate = constant_index(1.0)
+    if fringe and (dom.key != "wavenumber" or index is None):
+        raise ValueError("式 8 の膜厚算出は、波数ドメインで膜の屈折率を与えたときだけ使えます。")
+
     grid, signals, band_actual = build_analysis_grid(spec, lo, hi, dom, interp)
     n = grid.size
     step = float(np.mean(np.diff(grid)))
@@ -827,12 +1313,26 @@ def analyze_band(spec: SpectrumData, lo: float, hi: float, window: str = "hann",
         interp=interp,
         fit_method=fit,
         grid_points=int(grid_points) if fit != "none" else 0,
+        peak_weight=peak_weight,
+        fit_model=fit_model,
+        index=index if dom.key == "wavenumber" else None,
+        substrate=substrate if fit_model == "reflectance" else None,
     )
 
-    if fit != "none":
+    # 波数ドメインで屈折率があれば、分散を考慮した有効屈折率を求める (式 6, 7)
+    if analysis.index is not None:
+        wl_lo, wl_hi = band_actual
+        analysis.n_band = tuple(float(v) for v in index.n(np.array([wl_lo, wl_hi])))
+        analysis.n_eff = effective_index(index, wl_lo, wl_hi)
+        analysis.group_index = group_index_range(index, wl_lo, wl_hi)
+
+    if fit != "none" or fringe:
         x_fit, y_fit = fit_samples(spec, lo, hi, dom)
-        degree = (int(baseline_degree) if baseline_degree is not None
-                  else BASELINE_DEGREE.get(detrend, 1))
+    if fit != "none":
+        default_degree = BASELINE_DEGREE.get(detrend, 1)
+        if fit_model == "reflectance":
+            default_degree = 0                    # 物理モデルなので一定のずれだけ許す
+        degree = int(baseline_degree) if baseline_degree is not None else default_degree
         if degree < 0:
             raise ValueError("ベースラインの次数は 0 以上にしてください。")
 
@@ -846,15 +1346,42 @@ def analyze_band(spec: SpectrumData, lo: float, hi: float, window: str = "hann",
         search[0] = False
         if not search.any():
             raise ValueError("ピーク探索範囲が空です。--peak-min を小さくしてください。")
-        idx = int(np.argmax(np.where(search, amp, -np.inf)))
+        score = amp ** 2
+        if peak_weight == "m2":
+            # 論文の第 4 章: パワースペクトルに番号 m の 2 乗を掛けて探す。
+            # 高い位置にある膜のピークを強め、低い位置の偽のピークを弱める。
+            score = score * (freq / analysis.resolution) ** 2
+        idx = int(np.argmax(np.where(search, score, -np.inf)))
+        if peak_weight == "m2":
+            # 重みで山の肩が選ばれることがあるので、元の振幅の極大まで移る
+            idx = _climb_to_local_max(amp, idx, search)
         pk_freq, pk_amp = (parabolic_peak(freq, amp, idx) if refine_peak
                            else (float(freq[idx]), float(amp[idx])))
 
         fit_result = None
-        if fit != "none":
+        if fit != "none" and fit_model == "reflectance":
+            d_start = pk_freq / (2.0 * analysis.n_eff)
+            ng_lo, ng_hi = analysis.group_index
+            # 分散で縞の間隔が帯域内で変わると、FFT のピークは真の膜厚から
+            # 最大 d × (n_g の幅) / n_eff ずれる。その分だけ探索範囲を広げる
+            margin = d_start * (ng_hi - ng_lo) / analysis.n_eff
+            fit_result = refine_reflectance_fit(
+                x_fit, y_fit[:, j], d_start, analysis.thickness_resolution,
+                index, substrate, analysis.n_eff, method=fit, degree=degree,
+                n_grid=grid_points, max_iter=max_iter, d_margin=margin)
+        elif fit != "none":
             fit_result = refine_peak_fit(
                 x_fit, y_fit[:, j], pk_freq, analysis.resolution, dom.unit_scale,
                 method=fit, degree=degree, n_grid=grid_points, max_iter=max_iter)
+            if analysis.n_eff is not None:
+                fit_result.thickness = fit_result.frequency / (2.0 * analysis.n_eff)
+                if fit_result.stderr is not None:
+                    fit_result.thickness_stderr = fit_result.stderr / (2.0 * analysis.n_eff)
+
+        fringe_result = None
+        if fringe:
+            opd_hint = fit_result.frequency if fit_result is not None else pk_freq
+            fringe_result = fringe_thickness(1.0 / x_fit, y_fit[:, j], index, opd_hint)
 
         analysis.results.append(ColumnFFTResult(
             column=name,
@@ -865,6 +1392,7 @@ def analyze_band(spec: SpectrumData, lo: float, hi: float, window: str = "hann",
             peak_amplitude=pk_amp,
             peak_index=idx,
             fit=fit_result,
+            fringe=fringe_result,
         ))
     return analysis
 
@@ -987,7 +1515,8 @@ def plot_fourier_spectra(analysis: BandAnalysis, out_path: Path | None,
     ax.set_ylabel("Amplitude")
     ax.set_title(
         f"Fourier spectra  ({analysis.band[0]:g}-{analysis.band[1]:g} nm, "
-        f"domain: {dom.key}, window: {analysis.window}, N = {analysis.n_points})")
+        f"domain: {dom.key}, window: {analysis.window}, N = {analysis.n_points}"
+        + (", peak search: PSD x m$^2$" if analysis.peak_weight == "m2" else "") + ")")
     ax.legend(title="Condition", ncol=2, fontsize=9)
     fig.tight_layout()
     if out_path:
@@ -1105,8 +1634,10 @@ def plot_fit_check(analysis: BandAnalysis, out_path: Path | None) -> plt.Figure 
                 color=color_of[res.column], label="fit", zorder=2)
         ax.plot(fr.x[mask], fr.y[mask], "o", ms=2.6, color="black",
                 label="data", zorder=3)
-        ax.set_title(f"condition {res.column}: {fr.frequency:.6g} {dom.freq_unit_en}",
-                     fontsize=9)
+        title = f"condition {res.column}: {fr.frequency:.6g} {dom.freq_unit_en}"
+        if fr.thickness is not None:
+            title += f"  (d = {fr.thickness:.6g} nm)"
+        ax.set_title(title, fontsize=9)
         ax.text(0.02, 0.04, f"$R^2$ = {fr.r2:.5f}\nRMSE = {fr.rmse:.2e}",
                 transform=ax.transAxes, fontsize=8, va="bottom",
                 bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85))
@@ -1118,6 +1649,7 @@ def plot_fit_check(analysis: BandAnalysis, out_path: Path | None) -> plt.Figure 
 
     fig.suptitle(f"Fit check  ({analysis.band[0]:g}-{analysis.band[1]:g} nm, "
                  f"domain: {dom.key}, method: {analysis.fit_method.upper()}, "
+                 f"model: {analysis.fit_model}, "
                  f"last ~{FIT_CHECK_FRINGES} fringes of the band)", fontsize=10)
     fig.supxlabel(dom.sample_axis_label, fontsize=9)
     fig.supylabel("Reflectance", fontsize=9)
@@ -1171,6 +1703,7 @@ def peaks_dataframe(analysis: BandAnalysis,
 
     if analysis.fit_method != "none":
         df["peak_method"] = analysis.fit_method
+        df["fit_model"] = analysis.fit_model
         df[f"fft_{dom.peak_col}"] = [r.peak_frequency for r in res]
         df[f"grid_{dom.peak_col}"] = [r.fit.grid_frequency for r in res]
         if analysis.fit_method == "lm":
@@ -1182,15 +1715,58 @@ def peaks_dataframe(analysis: BandAnalysis,
         if analysis.fit_method == "lm":
             df["fit_iterations"] = [r.fit.iterations for r in res]
             df["fit_converged"] = [r.fit.converged for r in res]
+        if analysis.fit_model == "reflectance":
+            df["fit_scale"] = [r.fit.scale for r in res]
         df["fit_note"] = [r.fit.note for r in res]
 
-    # 波数ドメインでは光路差から膜厚 d = OPD / (2n) を推定できる
-    if dom.key == "wavenumber" and refractive_index:
-        n_ref = 2.0 * float(refractive_index)
-        df["estimated_thickness_nm"] = df[dom.peak_col] / n_ref
+    # 波数ドメインでは光路差から膜厚 d = OPD / (2 n_eff) を推定できる (式 7)
+    n_eff = _effective_index_for_output(analysis, refractive_index)
+    if n_eff is not None:
+        df["estimated_thickness_nm"] = df[dom.peak_col] / (2.0 * n_eff)
         if f"{dom.peak_col}_stderr" in df.columns:
-            df["estimated_thickness_stderr_nm"] = df[f"{dom.peak_col}_stderr"] / n_ref
+            df["estimated_thickness_stderr_nm"] = (
+                df[f"{dom.peak_col}_stderr"] / (2.0 * n_eff))
+
+    # 隣接する極大から求めた膜厚 (式 8)
+    if any(r.fringe is not None for r in res):
+        def pick(attr):
+            return [getattr(r.fringe, attr) if r.fringe is not None else np.nan
+                    for r in res]
+        df["fringe_thickness_nm"] = pick("thickness")
+        df["fringe_thickness_sem_nm"] = pick("sem")
+        df["fringe_pairs"] = [r.fringe.pairs if r.fringe is not None else 0 for r in res]
+        df["fringe_reliable"] = [bool(r.fringe.reliable) if r.fringe is not None else False
+                                 for r in res]
     return df
+
+
+def _effective_index_for_output(analysis: BandAnalysis,
+                                refractive_index: float | None = None) -> float | None:
+    """出力に使う有効屈折率. 解析時に屈折率モデルがあればそれを優先する."""
+    if analysis.domain.key != "wavenumber":
+        return None
+    if analysis.n_eff is not None:
+        return analysis.n_eff
+    if refractive_index:
+        return float(refractive_index)
+    return None
+
+
+def absorption_thickness_limit(analysis: BandAnalysis) -> tuple[float, float] | None:
+    """吸収のある膜で測定できる最大膜厚の目安 d_m ≈ (0.4〜0.75) λ / k (論文の式 17).
+
+    吸収が強いと裏面からの反射が減衰し、縞の振幅が雑音に埋もれる。
+    論文は SNR 1000〜5000 の検出器で係数 0.4〜0.75 としている。
+    帯域内で λ/k が最も小さい波長が制約になる。吸収がなければ None。
+    """
+    if analysis.index is None:
+        return None
+    wl = np.linspace(*analysis.band_actual, 256)
+    k = analysis.index.k(wl)
+    if not np.any(k > 0.0):
+        return None
+    ratio = float(np.min(wl[k > 0.0] / k[k > 0.0]))
+    return 0.4 * ratio, 0.75 * ratio
 
 
 def spectra_dataframe(analysis: BandAnalysis) -> pd.DataFrame:
@@ -1216,7 +1792,12 @@ def summary_dict(spec: SpectrumData, analysis: BandAnalysis,
         }
         if r.fit is not None:
             entry["fit"] = {
+                "model": r.fit.model_name,
                 "method": r.fit.method,
+                "thickness_nm": r.fit.thickness,
+                "thickness_stderr_nm": r.fit.thickness_stderr,
+                "scale": r.fit.scale,
+                "grid_points_used": r.fit.grid_points_used,
                 "fft_peak": r.fit.fft_frequency,
                 "grid_peak": r.fit.grid_frequency,
                 "peak": r.fit.frequency,
@@ -1229,10 +1810,34 @@ def summary_dict(spec: SpectrumData, analysis: BandAnalysis,
                 "converged": r.fit.converged,
                 "note": r.fit.note,
             }
-        if dom.key == "wavenumber" and refractive_index:
-            entry["estimated_thickness_nm"] = (
-                r.estimate / (2.0 * float(refractive_index)))
+        n_eff = _effective_index_for_output(analysis, refractive_index)
+        if n_eff is not None:
+            entry["estimated_thickness_nm"] = r.estimate / (2.0 * n_eff)
+        if r.fringe is not None:
+            entry["fringe"] = {
+                "thickness_nm": r.fringe.thickness,
+                "sem_nm": r.fringe.sem,
+                "std_nm": r.fringe.std,
+                "pairs": r.fringe.pairs,
+                "points_per_fringe": r.fringe.points_per_fringe,
+                "reliable": r.fringe.reliable,
+            }
         columns.append(entry)
+
+    n_eff_out = _effective_index_for_output(analysis, refractive_index)
+    limit = absorption_thickness_limit(analysis)
+    thickness_info = None if n_eff_out is None else {
+        "film_index": (analysis.index.description if analysis.index is not None
+                       else f"一定 n = {refractive_index:g}"),
+        "n_at_band_edges": list(analysis.n_band) if analysis.n_band else None,
+        "n_eff_eq7": n_eff_out,
+        "group_index_range": list(analysis.group_index) if analysis.group_index else None,
+        "thickness_resolution_nm_eq6": analysis.resolution / (2.0 * n_eff_out),
+        "thickness_max_nm": analysis.nyquist / (2.0 * n_eff_out),
+        "substrate_index": (analysis.substrate.description
+                            if analysis.substrate is not None else None),
+        "absorption_thickness_limit_nm_eq17": list(limit) if limit else None,
+    }
 
     return {
         "source": spec.source,
@@ -1249,7 +1854,10 @@ def summary_dict(spec: SpectrumData, analysis: BandAnalysis,
         "detrend": analysis.detrend,
         "zero_pad_factor": analysis.zero_pad,
         "interpolation": analysis.interp,
+        "peak_weight": analysis.peak_weight,
         "peak_method": analysis.fit_method,
+        "fit_model": analysis.fit_model if analysis.fit_method != "none" else None,
+        "thickness": thickness_info,
         "grid_points": analysis.grid_points or None,
         "grid_half_width_in_resolution": (GRID_HALF_WIDTH
                                           if analysis.fit_method != "none" else None),
@@ -1294,7 +1902,30 @@ def print_report(spec: SpectrumData, analysis: BandAnalysis,
         "lm": (f"FFT -> グリッドサーチ (±{GRID_HALF_WIDTH:g}×分解能 を "
                f"{analysis.grid_points} 分割) -> Levenberg-Marquardt 法"),
     }[analysis.fit_method]
+    if analysis.fit_method != "none":
+        model_label = {"sinusoid": "正弦波 + ベースライン",
+                       "reflectance": "多重反射の反射率 (式 1, 15)"}[analysis.fit_model]
+        method_label += f"  [モデル: {model_label}]"
     print(f" 精密化              : {method_label}")
+    if analysis.peak_weight == "m2":
+        print(" ピーク探索          : パワースペクトル × m² (論文の第 4 章)")
+
+    # 膜厚に関する情報 (波数ドメインで屈折率があるとき)
+    n_eff = _effective_index_for_output(analysis, refractive_index)
+    if n_eff is not None:
+        desc = (analysis.index.description if analysis.index is not None
+                else f"一定 n = {refractive_index:g}")
+        print(f" 膜の屈折率          : {desc}")
+        if analysis.n_band is not None and analysis.index.kind != "constant":
+            print(f" n(λmin), n(λmax)    : {analysis.n_band[0]:.6g}, {analysis.n_band[1]:.6g}"
+                  f"   -> 有効屈折率 n_eff (式 7) = {n_eff:.6g}")
+        print(f" 膜厚の分解能 (式 6) : {analysis.resolution / (2 * n_eff):.6g} nm"
+              f"   最大膜厚: {analysis.nyquist / (2 * n_eff):.6g} nm")
+        if analysis.substrate is not None:
+            print(f" 基板の屈折率        : {analysis.substrate.description}")
+        limit = absorption_thickness_limit(analysis)
+        if limit is not None:
+            print(f" 吸収による最大膜厚の目安 (式 17) : {limit[0]:.6g} - {limit[1]:.6g} nm")
     print(bar)
 
     df = peaks_dataframe(analysis, refractive_index)
@@ -1305,10 +1936,33 @@ def print_report(spec: SpectrumData, analysis: BandAnalysis,
                 f"grid_{dom.peak_col}"]
         if analysis.fit_method == "lm":
             cols += [dom.peak_col, f"{dom.peak_col}_stderr"]
-        cols += ["fit_amplitude", "fit_r2"]
-    if "estimated_thickness_nm" in df.columns:
-        cols.append("estimated_thickness_nm")
+        cols += (["fit_scale"] if analysis.fit_model == "reflectance"
+                 else ["fit_amplitude"]) + ["fit_r2"]
+    for extra in ("estimated_thickness_nm", "estimated_thickness_stderr_nm",
+                  "fringe_thickness_nm", "fringe_thickness_sem_nm", "fringe_pairs"):
+        if extra in df.columns:
+            cols.append(extra)
     print(df[cols].to_string(index=False, float_format=lambda v: f"{v:.8g}"))
+
+    # 分散で FFT のピークが広がっていないか (論文の第 4 章)
+    uses_dispersion_method = (
+        (analysis.fit_method != "none" and analysis.fit_model == "reflectance")
+        or any(r.fringe is not None for r in analysis.results))
+    if (analysis.group_index is not None and n_eff is not None
+            and not uses_dispersion_method):
+        spread = max(abs(r.estimate) for r in analysis.results) * (
+            analysis.group_index[1] - analysis.group_index[0]) / n_eff
+        if spread > 2.0 * analysis.resolution:
+            print(bar)
+            print(f" [注意] 屈折率の分散で縞の間隔が帯域内で変わり、FFT のピークが最大で")
+            print(f"        分解能の約 {spread / analysis.resolution:.0f} 倍に広がっています。"
+                  "正弦波モデルは合わなくなるので、")
+            print("        --fit-model reflectance (式 1) か --fringe (式 8) を推奨します。")
+    if "fringe_reliable" in df.columns and not df["fringe_reliable"].all():
+        bad = df.loc[~df["fringe_reliable"], "column"].tolist()
+        print(bar)
+        print(f" [注意] 列 {', '.join(bad)} は式 8 の結果の信頼性が低いです "
+              f"(縞 1 周期あたり {FRINGE_MIN_POINTS:g} 点未満、または隣接ペアが 3 組未満)。")
 
     if analysis.fit_method != "none":
         poor = df.loc[df["fit_r2"] < FIT_R2_WARN, "column"].tolist()
@@ -1318,10 +1972,14 @@ def print_report(spec: SpectrumData, analysis: BandAnalysis,
         if poor:
             print(f" [警告] 列 {', '.join(poor)} はフィットの決定係数が "
                   f"{FIT_R2_WARN} 未満です。")
-            print("        単一の正弦波モデルがデータに合っていません。縞の間隔が帯域内で")
-            print("        変化している (波長ドメインで広帯域を見ている、分散が大きい)、")
-            print("        複数の縞が重なっている、などが考えられます。精密化の値は")
-            print("        信頼できないので、波数ドメインや帯域の分割を検討してください。")
+            if analysis.fit_model == "reflectance":
+                print("        反射率モデルがデータに合っていません。膜や基板の屈折率、")
+                print("        多層膜であることなどを見直してください。")
+            else:
+                print("        単一の正弦波モデルがデータに合っていません。縞の間隔が帯域内で")
+                print("        変化している (波長ドメインで広帯域を見ている、分散が大きい)、")
+                print("        複数の縞が重なっている、などが考えられます。精密化の値は")
+                print("        信頼できないので、波数ドメインや帯域の分割を検討してください。")
         for _, row in notes.iterrows():
             print(f" [注意] 列 {row['column']}: {row['fit_note']}")
 
@@ -1417,8 +2075,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--baseline-degree", type=int, default=None,
                         help="精密化モデルのベースライン多項式の次数 "
                              "(既定: --detrend linear なら 1、それ以外は 0)")
-    parser.add_argument("-n", "--refractive-index", type=float, default=None,
-                        help="屈折率 n。波数ドメインで膜厚 d = OPD/(2n) を推定する")
+    parser.add_argument("--peak-weight", choices=list(PEAK_WEIGHTS), default="none",
+                        help="ピーク探索の重み。m2 ならパワースペクトルに番号の 2 乗を掛けて "
+                             "探し、低い位置の偽のピークを抑える (論文の第 4 章, 既定: none)")
+    index_group = parser.add_mutually_exclusive_group()
+    index_group.add_argument("-n", "--refractive-index", type=float, default=None,
+                             help="膜の屈折率 (一定)。波数ドメインで膜厚 d = OPD/(2n) を推定する")
+    index_group.add_argument("--cauchy", type=parse_cauchy, default=None, metavar="A,B[,C]",
+                             help="膜の屈折率を Cauchy の式 n = A + B/λ² + C/λ⁴ "
+                                  "(λ: µm) で与える。分散を考慮した有効屈折率 (式 7) を使う")
+    index_group.add_argument("--n-table", default=None, metavar="CSV",
+                             help="膜の屈折率テーブル (1 列目 波長 nm, 2 列目 n, 3 列目 k [任意])")
+    sub_group = parser.add_mutually_exclusive_group()
+    sub_group.add_argument("--substrate-n", type=float, default=None,
+                           help="基板の屈折率 (反射率モデル用, 既定: 1.0 = 自立膜)")
+    sub_group.add_argument("--substrate-table", default=None, metavar="CSV",
+                           help="基板の屈折率テーブル (形式は --n-table と同じ)")
+    parser.add_argument("--substrate-k", type=float, default=0.0,
+                        help="基板の消衰係数 k (--substrate-n と併用, 既定: 0)")
+    parser.add_argument("--fit-model", choices=list(FIT_MODELS), default="sinusoid",
+                        help="精密化のモデル。reflectance なら多重反射の反射率の式で "
+                             "膜厚を直接フィットする (論文の式 1, 15。波数ドメインと屈折率が必要, "
+                             "既定: sinusoid)")
+    parser.add_argument("--fringe", action="store_true",
+                        help="隣接する極大の位置から膜厚を求める (論文の式 8。"
+                             "波数ドメインと屈折率が必要)")
     parser.add_argument("-o", "--outdir", default="output",
                         help="出力ディレクトリ (既定: output)")
     parser.add_argument("--xmax", default="auto",
@@ -1529,18 +2210,71 @@ def prompt_settings(args: argparse.Namespace, spec: SpectrumData) -> argparse.Na
     return args
 
 
+def configure_index_options(args: argparse.Namespace, domains: list[DomainInfo],
+                            parser: argparse.ArgumentParser) -> None:
+    """屈折率関連のオプションからモデルを組み立て、組み合わせを検証する.
+
+    結果は args.index_model / args.substrate_model に入れる。
+    """
+    if args.cauchy is not None:
+        args.index_model = cauchy_index(args.cauchy)
+    elif args.n_table is not None:
+        args.index_model = table_index(args.n_table)
+    elif args.refractive_index is not None:
+        args.index_model = constant_index(args.refractive_index)
+    else:
+        args.index_model = None
+
+    if args.substrate_table is not None:
+        args.substrate_model = table_index(args.substrate_table)
+    elif args.substrate_n is not None:
+        args.substrate_model = constant_index(args.substrate_n, args.substrate_k)
+    else:
+        args.substrate_model = None
+
+    # --- まず組み合わせの誤りを検出する ----------------------------------
+    has_sigma = any(d.key == "wavenumber" for d in domains)
+    needs_sigma = [name for name, used in (("--fit-model reflectance",
+                                            args.fit_model == "reflectance"),
+                                           ("--fringe", args.fringe)) if used]
+    if needs_sigma and args.index_model is None:
+        parser.error(f"{', '.join(needs_sigma)} には膜の屈折率 "
+                     "(-n / --cauchy / --n-table) が必要です。")
+    if needs_sigma and not has_sigma:
+        parser.error(f"{', '.join(needs_sigma)} は波数ドメインでのみ使えます。"
+                     "--domain wavenumber または both を指定してください。")
+
+    # --- 問題なければ、必要な既定値を補う ----------------------------------
+    if args.fit_model == "reflectance":
+        if args.fit == "none":
+            args.fit = "lm"
+            print("[情報] --fit-model reflectance のため --fit lm を有効にしました。")
+        if args.substrate_model is None:
+            args.substrate_model = constant_index(1.0)
+            print("[情報] 基板の屈折率が未指定のため 1.0 (自立膜) とします。"
+                  "基板上の膜なら --substrate-n を指定してください。")
+    if needs_sigma and len(domains) > 1:
+        print(f"[情報] {', '.join(needs_sigma)} は波数ドメインの解析にだけ適用します。")
+
+
 def run_band(spec: SpectrumData, band: tuple[float, float], domain: DomainInfo,
              args: argparse.Namespace, outdir: Path) -> BandAnalysis:
     """1 帯域・1 ドメイン分の解析・保存・描画をまとめて実行する."""
+    sigma = domain.key == "wavenumber"
     analysis = analyze_band(spec, band[0], band[1], window=args.window,
                             detrend=args.detrend, zero_pad=args.zero_pad,
                             kaiser_beta=args.kaiser_beta,
                             peak_min=args.peak_min, refine_peak=args.refine_peak,
                             domain=domain, interp=args.interp, fit=args.fit,
                             grid_points=args.grid_points, max_iter=args.max_iter,
-                            baseline_degree=args.baseline_degree)
+                            baseline_degree=args.baseline_degree,
+                            peak_weight=args.peak_weight,
+                            index=args.index_model if sigma else None,
+                            substrate=args.substrate_model if sigma else None,
+                            fit_model=args.fit_model if sigma else "sinusoid",
+                            fringe=args.fringe and sigma)
     fit_regression(analysis)
-    n_ref = args.refractive_index
+    n_ref = None                       # 屈折率は analysis.index に保持している
     print_report(spec, analysis, n_ref)
 
     prefix = outdir / analysis.label
@@ -1590,6 +2324,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.window = resolve_window_name(args.window)
     domains = resolve_domain_arg(args.domain)
     bands = args.band or [(float(spec.wavelength[0]), float(spec.wavelength[-1]))]
+    configure_index_options(args, domains, parser)
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)

@@ -59,6 +59,48 @@ LM 法は追加ライブラリなしで numpy だけで実装しています。�
 フィットの決定係数が 0.9 を下回る列は、正弦波モデルが合っていない (縞間隔が帯域内で
 変化している等) として警告を出します。仕組みは [CODE_GUIDE.md](CODE_GUIDE.md) の第 6 章を参照してください。
 
+## 膜厚測定の拡張 (論文のその他の手法)
+
+同じ論文 (Quinten 2019) の、膜厚測定に特有の問題への対策も使えます。
+いずれも波数ドメイン (`--domain wavenumber`) で使います。
+
+| 手法 | 論文 | オプション |
+|---|---|---|
+| 分散を考慮した有効屈折率 n_eff と膜厚の分解能 | 式 6, 7 | `--cauchy A,B[,C]` / `--n-table CSV` |
+| 隣接する極大の位置から膜厚を求める | 式 8 | `--fringe` |
+| 多重反射の反射率モデルで膜厚をフィット | 式 1, 15 | `--fit-model reflectance` (+ `--substrate-n` / `--substrate-table`) |
+| パワースペクトル × m² の重み付きピーク探索 | 第 4 章 | `--peak-weight m2` |
+| 吸収による最大膜厚の目安 | 式 17 | 屈折率テーブルに k があれば自動表示 |
+
+```bash
+python ir_ft_analysis.py -i dataset_dispersion.csv -d wavenumber --cauchy 1.56,0.005 --substrate-n 3.6 --fit-model reflectance --fringe
+python ir_ft_analysis.py -i dataset_background.csv -d wavenumber -n 1.5 --peak-weight m2
+```
+
+**膜の屈折率の与え方** (いずれか 1 つ):
+
+- `-n 1.5`: 一定の値。n_eff = n なので従来どおり
+- `--cauchy 1.56,0.005`: Cauchy の式 n = A + B/λ² + C/λ⁴ (λ: µm)
+- `--n-table film.csv`: 1 列目 波長 [nm]、2 列目 n、3 列目 k (任意) の CSV。点の間は線形補間
+
+分散のある膜 (`dataset_dispersion.csv`、Si 基板上、膜厚 2〜50 µm) での膜厚の誤差:
+
+| 方法 | 5〜50 µm での最大誤差 |
+|---|---|
+| FFT・一定の屈折率 (帯域中央の値) | 2.6 % |
+| FFT・有効屈折率 (式 7) | 0.59 % |
+| 隣接極大 (式 8) | **0.009 %** |
+| 反射率モデル + LM (式 1) | **0.003 nm** |
+
+強いベースラインに弱い縞が乗ったデータ (`dataset_background.csv`) では、
+通常の探索はベースラインの残りを拾って全条件で失敗し、`--peak-weight m2` では全条件で
+縞のピークを正しく検出しました。ただし重みは高い位置のノイズも強調するので、
+低い位置に偽のピークが出ているときだけ使ってください。
+
+なお論文の式 5 は FFT の最大膜厚を (N − 1)·d_min としていますが、実数データ N 点の FFT で
+区別できるのは約 (N/2)·d_min までです。本ツールは N/2 を限界として扱います。
+詳細と実装していない項目は [CODE_GUIDE.md](CODE_GUIDE.md) の第 7 章を参照してください。
+
 ## 入力データ形式
 
 | Wavelength (nm) | 2 | 4 | 6 | … |
@@ -140,8 +182,15 @@ python ir_ft_analysis.py --list-windows
 | `-f, --fit` | `none` | ピーク位置の精密化。`none` / `grid` / `lm` |
 | `--grid-points` | `16` | グリッドサーチの分割数 M (±2×分解能 を M 等分) |
 | `--max-iter` | `100` | LM 法の最大反復回数 |
-| `--baseline-degree` | 自動 | 精密化モデルのベースライン多項式の次数 (`--detrend linear` なら 1、それ以外は 0) |
-| `-n, --refractive-index` | なし | 屈折率。波数ドメインで膜厚を推定 |
+| `--baseline-degree` | 自動 | 精密化モデルのベースライン多項式の次数 (`--detrend linear` なら 1、それ以外は 0。反射率モデルは 0) |
+| `--peak-weight` | `none` | ピーク探索の重み。`m2` でパワースペクトル × m² (論文の第 4 章) |
+| `-n, --refractive-index` | なし | 膜の屈折率 (一定)。波数ドメインで膜厚を推定 |
+| `--cauchy A,B[,C]` | なし | 膜の屈折率を Cauchy の式で与える (λ: µm)。有効屈折率 (式 7) を使う |
+| `--n-table CSV` | なし | 膜の屈折率テーブル (波長 nm, n, k) |
+| `--substrate-n` / `--substrate-k` | `1.0` / `0` | 基板の屈折率 (反射率モデル用。1.0 は自立膜) |
+| `--substrate-table CSV` | なし | 基板の屈折率テーブル |
+| `--fit-model` | `sinusoid` | 精密化のモデル。`reflectance` で多重反射の反射率の式 (論文の式 1, 15) |
+| `--fringe` | off | 隣接する極大の位置から膜厚を求める (論文の式 8) |
 | `--xmax` | `auto` | フーリエスペクトル図の横軸上限。数値 / `auto` / `nyquist` |
 | `-o, --outdir` | `output` | 出力ディレクトリ |
 | `--no-raw-plot` | off | 変換前の信号の図を出力しない |
@@ -163,7 +212,13 @@ python ir_ft_analysis.py --list-windows
 
 精密化した場合、`*_peaks.csv` のピーク位置の列 (`peak_wavenumber_per_100nm` /
 `peak_opd_nm`) には**精密化後の値**が入り、回帰もその値で行います。
-FFT の値は `fft_` で始まる列に残ります。
+FFT の値は `fft_` で始まる列に残ります。反射率モデルでは、膜厚を光路差に換算した値
+2·n_eff·d が入ります。
+
+波数ドメインで膜の屈折率を与えると、膜厚 (`estimated_thickness_nm`、光路差 / 2n_eff) が
+付きます。`--fringe` では式 8 の膜厚 (`fringe_thickness_nm` と標準誤差・ペア数)、
+反射率モデルでは倍率 (`fit_scale`、理想は 1) も付きます。`*_summary.json` の
+`thickness` に n_eff・膜厚の分解能・最大膜厚などがまとめて記録されます。
 
 ## 計算の定義
 
@@ -229,6 +284,8 @@ python make_testdata.py
 | `dataset_highfreq.csv` | 波数がナイキスト限界の 10〜90 % に並ぶ正弦波 | 高周波側の検証 |
 | `dataset_alias.csv` | 限界を超える波数を含む | 折り返しの確認 |
 | `dataset_film.csv` | 屈折率 1.5、膜厚 40〜280 µm の平行平板干渉 | 波数ドメインの検証 |
+| `dataset_dispersion.csv` | 分散のある膜 (Cauchy の式) を Si 基板に載せた、多重反射を含む厳密な反射率 | 有効屈折率・式 8・反射率モデルの検証 |
+| `dataset_background.csv` | 強い山形のベースラインに弱い縞が乗ったデータ | 重み付きピーク探索の検証 |
 
 それぞれ真値を記した `*_truth.csv` と条件を記した `*_meta.json` が付属します。
 
@@ -240,8 +297,9 @@ python test_ir_ft_analysis.py
 
 全窓関数の復元精度、回帰とナイキスト到達条件、エイリアシング、光路差と膜厚の復元、
 補間方式の比較、振幅正規化、不等間隔・欠測データへの耐性、引数パーサ、
-精密化 (グリッドサーチと LM 法の精度、標準誤差の妥当性、モデル不一致の検出) を
-検証します (66 項目)。
+精密化 (グリッドサーチと LM 法の精度、標準誤差の妥当性、モデル不一致の検出)、
+論文のその他の手法 (屈折率モデル、式 7 の有効屈折率、反射率の式の独立検証、
+分散のある膜での各手法の精度、PSD × m²、式 17) を検証します (88 項目)。
 
 ## 付属テストデータでの結果 (dataset.csv, 300–600 nm, hann 窓, 波長ドメイン)
 
