@@ -38,6 +38,16 @@ ir_ft_analysis.py / make_testdata.py / test_ir_ft_analysis.py を更新したら
 
 ## 2. まず動かしてみる
 
+最初に、必要なライブラリをまとめてインストールします。
+
+```bash
+pip install -r requirements.txt
+```
+
+`requirements.txt` には、使うライブラリ 5 つ（numpy、pandas、matplotlib、seaborn、
+scikit-learn）とバージョンの範囲が書いてあります。**下限は実際に動作を確認したバージョン**、
+上限は互換性が崩れうる次のメジャーバージョンです。動作確認は Python 3.14.6 で行いました。
+
 ```bash
 python ir_ft_analysis.py --band 300-600 --window hann
 ```
@@ -1014,3 +1024,4 @@ python test_ir_ft_analysis.py
 | 2026-08-18 | 高周波・エイリアシング・薄膜の検証用データ生成と自己テストを追加 |
 | 2026-11-21 | ピーク位置の精密化を追加（Quinten 2019 のグリッドサーチ + LM 法、標準誤差、モデル不一致の警告、当てはめ確認図）。第 6 章を新設 |
 | 2026-11-21 | 同論文の残りの手法を追加（分散を考慮した有効屈折率と膜厚の分解能 式 6, 7、隣接極大の式 8、多重反射の反射率モデル 式 1, 15、PSD × m² の重み付き探索、吸収による最大膜厚 式 17）。屈折率モデル（Cauchy の式・テーブル）と検証データ 2 種を追加。第 7 章を新設 |
+| 2026-11-21 | `requirements.txt` を追加し、第 2 章にインストール手順を追記 |

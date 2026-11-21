@@ -7,7 +7,7 @@
 - 検証用データ生成: [make_testdata.py](make_testdata.py)
 - 自己テスト: [test_ir_ft_analysis.py](test_ir_ft_analysis.py)
 - 初心者向けの詳しい解説: [CODE_GUIDE.md](CODE_GUIDE.md)
-- 使用ライブラリ: 標準ライブラリ, numpy, pandas, matplotlib, seaborn, scikit-learn
+- 使用ライブラリ: 標準ライブラリ, numpy, pandas, matplotlib, seaborn, scikit-learn（[requirements.txt](requirements.txt)）
 
 ## 2 つの変換ドメイン
 
@@ -115,6 +115,16 @@ python ir_ft_analysis.py -i dataset_background.csv -d wavenumber -n 1.5 --peak-w
 - 列内の欠測値は補間で埋めます
 
 ## 使い方
+
+### インストール
+
+```bash
+pip install -r requirements.txt
+```
+
+動作確認した環境は Python 3.14.6、numpy 2.4.6、pandas 3.0.3、matplotlib 3.11.0、
+seaborn 0.13.2、scikit-learn 1.9.0 です。[requirements.txt](requirements.txt) では
+これらを下限、次のメジャーバージョンを上限にしています。
 
 ### 基本
 
