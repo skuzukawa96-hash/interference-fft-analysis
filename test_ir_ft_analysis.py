@@ -19,10 +19,12 @@ import numpy as np
 import pandas as pd
 
 import make_testdata as mtd
-from ir_ft_analysis import (WINDOW_FUNCTIONS, analyze_band, fit_regression,
+from ir_ft_analysis import (DEFAULT_GRID_POINTS, FIT_R2_WARN, GRID_HALF_WIDTH,
+                            WINDOW_FUNCTIONS, analyze_band, fit_regression,
                             interpolate, is_near_nyquist, load_spectra,
                             make_window, parse_band, peaks_dataframe,
-                            resolve_domain, resolve_window_name)
+                            refine_peak_fit, resolve_domain,
+                            resolve_window_name)
 
 TMP = Path(tempfile.mkdtemp(prefix="ir_ft_test_"))
 _failures: list[str] = []
@@ -248,6 +250,101 @@ def test_parsers_and_output() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 9. 精密化: グリッドサーチ + Levenberg-Marquardt 法
+# ---------------------------------------------------------------------------
+
+def _sinusoid_csv(name: str, conditions, freq_of, amp: float = 0.2,
+                  noise: float = 0.0, seed: int = 0) -> Path:
+    """条件ごとに波数 freq_of(c) [/100nm] の正弦波を持つ CSV を作る."""
+    rng = np.random.default_rng(seed)
+    wl = np.arange(300.0, 600.0 + 0.25, 0.5)
+    data = {"Wavelength (nm)": wl}
+    for c in conditions:
+        y = (0.5 + 1e-4 * (wl - 450.0)
+             + amp * np.sin(2 * np.pi * freq_of(c) / 100.0 * wl + 0.4))
+        data[str(c)] = y + (rng.normal(0.0, noise, wl.size) if noise else 0.0)
+    return write_csv(pd.DataFrame(data), name)
+
+
+def test_peak_refinement() -> None:
+    print("\n[9] 精密化 (グリッドサーチ + Levenberg-Marquardt 法)")
+
+    # --- 格子点の間にある波数を、ノイズなしなら機械精度近くまで復元できるか ---
+    conds = [2, 4, 6, 8, 10, 12, 14]
+    spec = load_spectra(_sinusoid_csv("offbin.csv", conds, lambda c: c / (2 * np.pi)))
+    a_fft = analyze_band(spec, 300, 600)
+    a_grid = analyze_band(spec, 300, 600, fit="grid")
+    a_lm = analyze_band(spec, 300, 600, fit="lm")
+    truth = {c: c / (2 * np.pi) for c in conds}
+    err = {name: max(abs(r.estimate - truth[r.condition]) for r in a.results)
+           for name, a in (("fft", a_fft), ("grid", a_grid), ("lm", a_lm))}
+    res = a_fft.resolution
+    grid_step = 2 * GRID_HALF_WIDTH * res / DEFAULT_GRID_POINTS
+    check("FFT のみでは格子間隔ぶんの誤差が残る", err["fft"] > 0.1 * res,
+          f"最大誤差 {err['fft']:.4f} (分解能 {res:.4f})")
+    check("グリッドサーチの誤差 <= 刻みの半分", err["grid"] <= 0.5 * grid_step + 1e-12,
+          f"最大誤差 {err['grid']:.4f} (刻み {grid_step:.4f})")
+    check("LM 法の誤差 < 1e-8 /100nm", err["lm"] < 1e-8, f"最大誤差 {err['lm']:.2e}")
+    check("LM 法は FFT より 1000 倍以上正確", err["fft"] / max(err["lm"], 1e-300) > 1e3,
+          f"{err['fft'] / max(err['lm'], 1e-300):.1e} 倍")
+    check("LM 法は少ない反復で収束する (論文: 約 20 回)",
+          all(r.fit.converged and r.fit.iterations <= 20 for r in a_lm.results),
+          f"反復回数 {[r.fit.iterations for r in a_lm.results]}")
+    check("LM 法で振幅も正確 (真値 0.2)",
+          max(abs(r.fit.amplitude - 0.2) for r in a_lm.results) < 1e-8)
+    reg = fit_regression(a_lm)
+    check("回帰には精密化後の値が使われる (傾き = 1/2π)",
+          abs(reg.slope - 1 / (2 * np.pi)) < 1e-9, f"{reg.slope:.10f}")
+    check("最低次のビン付近 (探索範囲が負にはみ出す) でも動く",
+          abs(a_lm.results[0].estimate - 1 / np.pi) < 1e-8,
+          f"{a_lm.results[0].estimate:.10f} (真値 {1 / np.pi:.10f})")
+
+    # --- 標準誤差は実際のばらつきと一致するか (モンテカルロ) ---
+    rng = np.random.default_rng(7)
+    wl = np.arange(300.0, 600.0 + 0.25, 0.5)
+    f_true, sigma = 37.3456, 0.01
+    ests, ses = [], []
+    for _ in range(150):
+        y = (0.5 + 2e-4 * (wl - 450) + 0.2 * np.cos(2 * np.pi * f_true / 100 * wl + 0.3)
+             + rng.normal(0.0, sigma, wl.size))
+        fr = refine_peak_fit(wl, y, round(f_true / res) * res, res, 100.0, "lm")
+        ests.append(fr.frequency)
+        ses.append(fr.stderr)
+    ratio = np.std(ests, ddof=1) / np.mean(ses)
+    check("標準誤差が実際のばらつきと一致 (比 0.8-1.25)", 0.8 < ratio < 1.25,
+          f"実測 std / 推定 stderr = {ratio:.3f}")
+    check("ノイズ下でも偏りがない (|偏り| < stderr)",
+          abs(np.mean(ests) - f_true) < np.mean(ses), f"{np.mean(ests) - f_true:+.2e}")
+
+    # --- 波数ドメイン: 補間前の生データにフィットして光路差を復元できるか ---
+    data, truth_f, _ = mtd.make_film(snr=0.0, baseline_slope=0.0)
+    spec_f = load_spectra(write_csv(data, "film_fit.csv"))
+    a_f = analyze_band(spec_f, 700, 1000, domain="wavenumber", fit="lm")
+    worst = max(abs(r.estimate - t) for r, t in zip(a_f.results, truth_f["true_opd_nm"]))
+    check("波数ドメインで光路差の誤差 < 0.01 nm", worst < 0.01, f"最大誤差 {worst:.2e} nm")
+    n_band = int(((spec_f.wavelength >= 700) & (spec_f.wavelength <= 1000)).sum())
+    check("波数ドメインのフィットは補間前の点を使う",
+          a_f.results[0].fit.x.size == n_band and not np.allclose(
+              np.diff(a_f.results[0].fit.x), np.diff(a_f.results[0].fit.x)[0]),
+          "不等間隔の 1/λ をそのまま使用")
+
+    # --- モデルが合わないときに検出できるか ---
+    a_bad = analyze_band(spec_f, 700, 1000, domain="wavelength", fit="lm")
+    check("縞間隔が変化するデータではフィットの R² が低くなる",
+          all(r.fit.r2 < FIT_R2_WARN for r in a_bad.results),
+          f"R² 最大 {max(r.fit.r2 for r in a_bad.results):.3f}")
+
+    # --- 出力表 ---
+    df = peaks_dataframe(a_f, refractive_index=1.5)
+    need = ["fft_peak_opd_nm", "grid_peak_opd_nm", "peak_opd_nm_stderr",
+            "fit_r2", "estimated_thickness_stderr_nm"]
+    check("精密化の列が出力される", all(c in df.columns for c in need),
+          f"不足: {[c for c in need if c not in df.columns]}")
+    df_none = peaks_dataframe(analyze_band(spec_f, 700, 1000, domain="wavenumber"))
+    check("精密化しなければ列は増えない", "fit_r2" not in df_none.columns)
+
+
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     print(f"作業ディレクトリ: {TMP}")
@@ -259,6 +356,7 @@ def main() -> int:
     test_amplitude_normalization()
     test_robustness()
     test_parsers_and_output()
+    test_peak_refinement()
 
     print("\n" + "=" * 60)
     if _failures:

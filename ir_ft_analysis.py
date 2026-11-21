@@ -20,6 +20,9 @@
     6. 条件 対 振幅最大位置 の線形回帰 (直線の式・決定係数を図中に記載)
     7. 散布図にナイキスト限界の破線を引き、回帰直線との交点 (ナイキスト限界に
        達する条件) を算出・記録
+    8. FFT ピークの精密化 (--fit grid / lm)。FFT 結果の近傍をグリッドサーチし、
+       その最良点を初期値に Levenberg-Marquardt 法で非線形回帰する
+       (M. Quinten, SN Applied Sciences 1, 823 (2019) 第 5 章の手法)
 
 使用ライブラリ: 標準ライブラリ, numpy, pandas, matplotlib, seaborn, scikit-learn
 
@@ -224,6 +227,41 @@ class SpectrumData:
 
 
 @dataclass
+class FitResult:
+    """1 列分の精密化 (グリッドサーチ + Levenberg-Marquardt 法) の結果.
+
+    位置の値はすべて共役軸の単位 (波数/100nm または OPD [nm]) で持つ。
+    """
+
+    method: str                       # "grid" または "lm"
+    fft_frequency: float              # 出発点にした FFT のピーク位置
+    grid_frequency: float             # グリッドサーチで χ² 最小となった位置
+    frequency: float                  # 最終推定値
+    stderr: float | None              # 最終推定値の標準誤差 (LM のみ)
+    amplitude: float                  # フィットした正弦波の振幅
+    phase: float                      # 帯域中央での位相 [rad]
+    rmse: float                       # 残差の二乗平均平方根
+    r2: float                         # モデルの決定係数
+    iterations: int                   # LM の反復回数
+    converged: bool                   # LM が収束したか
+    note: str                         # 補足 (フォールバックした理由など)
+    grid_frequencies: np.ndarray      # グリッドサーチで調べた位置
+    grid_chi2: np.ndarray             # 各位置での χ²
+    x: np.ndarray                     # フィットに使った独立変数 (λ または 1/λ)
+    y: np.ndarray                     # フィットに使った反射率
+    model: np.ndarray                 # フィット結果のモデル値
+    params: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    x_center: float = 0.0             # 座標正規化の中心
+    half_width: float = 1.0           # 座標正規化の半幅
+    degree: int = 1                   # ベースライン多項式の次数
+
+    def evaluate(self, x: np.ndarray) -> np.ndarray:
+        """任意の独立変数でフィット後のモデル値を計算する (作図用)."""
+        u = (np.asarray(x, dtype=float) - self.x_center) / self.half_width
+        return _sinusoid_design(u, self.params[0], self.degree) @ self.params[1:]
+
+
+@dataclass
 class ColumnFFTResult:
     """1 条件 (1 列) 分のフーリエ変換結果."""
 
@@ -231,9 +269,15 @@ class ColumnFFTResult:
     condition: float
     frequency: np.ndarray             # 共役軸 (波数/100nm または OPD [nm])
     amplitude: np.ndarray             # 振幅 (入力と同じ単位)
-    peak_frequency: float
+    peak_frequency: float             # FFT で求めた振幅最大の位置
     peak_amplitude: float
     peak_index: int
+    fit: FitResult | None = None      # 精密化した場合の結果
+
+    @property
+    def estimate(self) -> float:
+        """回帰と出力に使う最終推定値 (精密化していれば精密化後の値)."""
+        return self.fit.frequency if self.fit is not None else self.peak_frequency
 
 
 @dataclass
@@ -270,6 +314,8 @@ class BandAnalysis:
     nyquist: float                     # ナイキスト限界 (共役軸の単位)
     resolution: float                  # 共役軸の分解能
     interp: str = "cubic"              # グリッド再配置に使った補間方式
+    fit_method: str = "none"           # 精密化の方式 (none / grid / lm)
+    grid_points: int = 0               # グリッドサーチの分割数 M
     results: list[ColumnFFTResult] = field(default_factory=list)
     regression: RegressionResult | None = None
 
@@ -523,13 +569,243 @@ def fourier_transform(grid: np.ndarray, y: np.ndarray, window: str = "hann",
     return freq * unit_scale, amp
 
 
+# ---------------------------------------------------------------------------
+# 精密化: グリッドサーチ + Levenberg-Marquardt 法
+# ---------------------------------------------------------------------------
+#
+# M. Quinten, "On the use of fast Fourier transform for optical layer thickness
+# determination", SN Applied Sciences 1, 823 (2019) 第 5 章の 2 段階法を実装する。
+#
+#   1. FFT のピーク f_FFT の周辺 [f_FFT - 2Δf, f_FFT + 2Δf] を M 等分し、
+#      各点でモデルとデータの二乗誤差 χ² を計算して最小の点を選ぶ
+#      (Δf は分解能。論文の d_min に当たる。論文の推奨は M = 16)
+#   2. その点を初期値として Levenberg-Marquardt 法で非線形最小二乗フィットする
+#
+# モデルは各ドメインの座標 x に対する正弦波 + 多項式ベースライン:
+#   y(x) = Σ b_k u^k + A_c cos(2π g u) + A_s sin(2π g u),   u = (x - x_c) / h
+# x_c は帯域中央、h は帯域の半幅。g は半幅あたりの周期数で、共役軸の値 f とは
+# f = g / h × unit_scale の関係にある。座標を [-1, 1] に正規化しておくと、
+# 波長ドメインでも波数ドメインでも同じ数値スケールで計算でき、条件数が良くなる。
+
+FIT_METHODS = ("none", "grid", "lm")
+
+#: グリッドサーチの既定の分割数 M (論文の推奨値)
+DEFAULT_GRID_POINTS = 16
+
+#: グリッドサーチの探索範囲の半幅 (分解能の何倍か。論文では 2)
+GRID_HALF_WIDTH = 2.0
+
+#: デトレンド方式に対応する、フィットのベースライン多項式の次数
+BASELINE_DEGREE = {"none": 0, "mean": 0, "linear": 1}
+
+
+def fit_samples(spec: SpectrumData, lo: float, hi: float, domain: DomainInfo
+                ) -> tuple[np.ndarray, np.ndarray]:
+    """非線形フィットに使うデータ (昇順の独立変数, 信号) を返す.
+
+    FFT と違い、最小二乗フィットはデータが等間隔である必要がない。
+    そのため波数ドメインでも 1/λ グリッドへ補間する前の点をそのまま使い、
+    補間による振幅の減衰や誤差を持ち込まないようにしている。
+    """
+    wl_band, data_band = select_band(spec, lo, hi)
+    if domain.key == "wavelength":
+        return wl_band, data_band
+    return 1.0 / wl_band[::-1], data_band[::-1]
+
+
+def _sinusoid_design(u: np.ndarray, g: float, degree: int) -> np.ndarray:
+    """周期 g を固定したときの計画行列 [1, u, ..., u^deg, cos, sin]."""
+    phase = 2.0 * np.pi * g * u
+    cols = [u ** k for k in range(degree + 1)]
+    cols += [np.cos(phase), np.sin(phase)]
+    return np.column_stack(cols)
+
+
+def _solve_linear(u: np.ndarray, y: np.ndarray, g: float, degree: int
+                  ) -> tuple[np.ndarray, float]:
+    """周期 g を固定し、残りの線形パラメータを最小二乗で解いて χ² を返す.
+
+    周期以外のパラメータ (ベースライン、cos と sin の係数) はモデルに線形に
+    入るので、周期さえ決めれば一発で最適値が求まる。グリッドサーチでは
+    これを使い、実質的に周期 1 個だけを走査している。
+    """
+    design = _sinusoid_design(u, g, degree)
+    coef, *_ = np.linalg.lstsq(design, y, rcond=None)
+    resid = y - design @ coef
+    return coef, float(resid @ resid)
+
+
+def grid_search(u: np.ndarray, y: np.ndarray, g0: float, dg: float,
+                degree: int, n_grid: int = DEFAULT_GRID_POINTS
+                ) -> tuple[np.ndarray, np.ndarray, int]:
+    """[g0 - 2dg, g0 + 2dg] を n_grid 等分した各点の χ² を調べる (論文の手順 1).
+
+    戻り値は (調べた周期, 各 χ², χ² 最小の添字)。周期は正でなければならない
+    ので、FFT ピークが低周波側の端にあるときは負の側を捨てる。
+    """
+    offsets = np.linspace(-GRID_HALF_WIDTH, GRID_HALF_WIDTH, int(n_grid) + 1)
+    gs = g0 + offsets * dg
+    gs = gs[gs > 0.0]
+    if gs.size == 0:
+        raise ValueError("グリッドサーチの探索範囲が空です。")
+    chi2 = np.array([_solve_linear(u, y, g, degree)[1] for g in gs])
+    return gs, chi2, int(np.argmin(chi2))
+
+
+def levenberg_marquardt(u: np.ndarray, y: np.ndarray, p0: np.ndarray,
+                        degree: int, max_iter: int = 100,
+                        ftol: float = 1e-12, xtol: float = 1e-12
+                        ) -> tuple[np.ndarray, float, np.ndarray, int, bool]:
+    """Levenberg-Marquardt 法で正弦波 + ベースラインを非線形フィットする (手順 2).
+
+    パラメータ p = [g, b_0, ..., b_deg, A_c, A_s]。
+    各反復で (JᵀJ + λ·diag(JᵀJ)) δ = Jᵀr を解いて p を更新する。
+    λ が小さいとガウス・ニュートン法 (速いが初期値が悪いと発散しやすい)、
+    大きいと最急降下法 (遅いが確実に下る) に近づく。χ² が下がれば λ を
+    1/10 にして大胆に、下がらなければ 10 倍にして慎重に進む。
+
+    戻り値は (最終パラメータ, χ², ヤコビアン, 反復回数, 収束したか)。
+    """
+    powers = np.column_stack([u ** k for k in range(degree + 1)])
+    i_c, i_s = degree + 2, degree + 3
+
+    def evaluate(p: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        phase = 2.0 * np.pi * p[0] * u
+        c, s = np.cos(phase), np.sin(phase)
+        model = powers @ p[1:degree + 2] + p[i_c] * c + p[i_s] * s
+        jac = np.empty((u.size, p.size))
+        jac[:, 0] = 2.0 * np.pi * u * (-p[i_c] * s + p[i_s] * c)   # ∂y/∂g
+        jac[:, 1:degree + 2] = powers                                # ∂y/∂b_k
+        jac[:, i_c] = c                                              # ∂y/∂A_c
+        jac[:, i_s] = s                                              # ∂y/∂A_s
+        return model, jac
+
+    p = np.asarray(p0, dtype=float).copy()
+    model, jac = evaluate(p)
+    resid = y - model
+    chi2 = float(resid @ resid)
+    lam = 1e-3
+    tiny = np.finfo(float).tiny
+
+    for it in range(1, int(max_iter) + 1):
+        jtj = jac.T @ jac
+        grad = jac.T @ resid
+        scale = np.diag(jtj).copy()
+        scale[scale <= 0.0] = 1.0
+        while True:
+            try:
+                delta = np.linalg.solve(jtj + lam * np.diag(scale), grad)
+            except np.linalg.LinAlgError:
+                delta = None
+            if delta is not None and np.all(np.isfinite(delta)):
+                p_new = p + delta
+                model_new, jac_new = evaluate(p_new)
+                resid_new = y - model_new
+                chi2_new = float(resid_new @ resid_new)
+                if chi2_new <= chi2:
+                    break
+            lam *= 10.0
+            if lam > 1e16:
+                # どの方向に動いても χ² が下がらない = すでに極小にいる
+                return p, chi2, jac, it - 1, True
+        small_f = (chi2 - chi2_new) <= ftol * max(chi2, tiny)
+        small_x = bool(np.all(np.abs(delta) <= xtol * (np.abs(p) + xtol)))
+        p, model, jac, resid, chi2 = p_new, model_new, jac_new, resid_new, chi2_new
+        lam = max(lam / 10.0, 1e-15)
+        if small_f or small_x:
+            return p, chi2, jac, it, True
+    return p, chi2, jac, int(max_iter), False
+
+
+def refine_peak_fit(x: np.ndarray, y: np.ndarray, fft_peak: float,
+                    resolution: float, unit_scale: float, method: str = "lm",
+                    degree: int = 1, n_grid: int = DEFAULT_GRID_POINTS,
+                    max_iter: int = 100) -> FitResult:
+    """FFT のピークを出発点に、グリッドサーチと LM 法でピーク位置を精密化する.
+
+    x, y はフィットに使うデータ、fft_peak と resolution は共役軸の単位。
+    method が "grid" ならグリッドサーチまで、"lm" なら LM 法まで実行する。
+    """
+    if method not in ("grid", "lm"):
+        raise ValueError(f"未知の精密化方式: {method!r} (grid/lm)")
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    x_c = 0.5 * (x.min() + x.max())
+    half = 0.5 * (x.max() - x.min())
+    u = (x - x_c) / half
+    to_g = half / unit_scale                    # 共役軸の値 -> 半幅あたりの周期数
+
+    g0 = fft_peak * to_g
+    dg = resolution * to_g
+    gs, chi2s, k = grid_search(u, y, g0, dg, degree, n_grid)
+    g_grid = float(gs[k])
+    coef, chi2 = _solve_linear(u, y, g_grid, degree)
+    params = np.concatenate([[g_grid], coef])
+
+    iterations, converged, stderr, note = 0, True, None, ""
+    if method == "lm":
+        p_lm, chi2_lm, jac, iterations, converged = levenberg_marquardt(
+            u, y, params, degree, max_iter=max_iter)
+        # 探索範囲から大きく外れたら、別の谷に落ちたとみなして採用しない
+        if p_lm[0] <= 0.0 or abs(p_lm[0] - g0) > (GRID_HALF_WIDTH + 0.5) * dg:
+            converged = False
+            note = "LM 法が探索範囲の外へ移動したため、グリッドサーチの結果を採用"
+        else:
+            params, chi2 = p_lm, chi2_lm
+            dof = max(y.size - params.size, 1)
+            try:
+                cov = np.linalg.inv(jac.T @ jac) * (chi2 / dof)
+                stderr = float(np.sqrt(max(cov[0, 0], 0.0))) / to_g
+            except np.linalg.LinAlgError:
+                stderr = float("nan")
+            if not converged:
+                note = f"LM 法が {max_iter} 回で収束しなかった"
+
+    model = _sinusoid_design(u, params[0], degree) @ params[1:]
+    a_c, a_s = float(params[-2]), float(params[-1])
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    return FitResult(
+        method=method,
+        fft_frequency=float(fft_peak),
+        grid_frequency=g_grid / to_g,
+        frequency=float(params[0]) / to_g,
+        stderr=stderr,
+        amplitude=float(np.hypot(a_c, a_s)),
+        phase=float(np.arctan2(-a_s, a_c)),
+        rmse=float(np.sqrt(chi2 / y.size)),
+        r2=1.0 - chi2 / ss_tot if ss_tot > 0 else float("nan"),
+        iterations=int(iterations),
+        converged=bool(converged),
+        note=note,
+        grid_frequencies=gs / to_g,
+        grid_chi2=chi2s,
+        x=x,
+        y=y,
+        model=model,
+        params=params,
+        x_center=float(x_c),
+        half_width=float(half),
+        degree=int(degree),
+    )
+
+
 def analyze_band(spec: SpectrumData, lo: float, hi: float, window: str = "hann",
                  detrend: str = "linear", zero_pad: int = 1,
                  kaiser_beta: float = 8.6, peak_min: float = 0.0,
                  refine_peak: bool = False,
                  domain: str | DomainInfo = "wavelength",
-                 interp: str = "cubic") -> BandAnalysis:
-    """指定帯域・指定ドメインで全条件列の FFT とピーク抽出を行う."""
+                 interp: str = "cubic", fit: str = "none",
+                 grid_points: int = DEFAULT_GRID_POINTS,
+                 max_iter: int = 100,
+                 baseline_degree: int | None = None) -> BandAnalysis:
+    """指定帯域・指定ドメインで全条件列の FFT とピーク抽出を行う.
+
+    fit が "grid" または "lm" なら、FFT のピークを出発点に精密化も行う。
+    baseline_degree はフィットのベースライン多項式の次数で、None なら
+    デトレンド方式に合わせる (linear なら 1 次、それ以外は 0 次)。
+    """
+    if fit not in FIT_METHODS:
+        raise ValueError(f"未知の精密化方式: {fit!r} ({'/'.join(FIT_METHODS)})")
     dom = domain if isinstance(domain, DomainInfo) else resolve_domain(domain)
     grid, signals, band_actual = build_analysis_grid(spec, lo, hi, dom, interp)
     n = grid.size
@@ -549,7 +825,16 @@ def analyze_band(spec: SpectrumData, lo: float, hi: float, window: str = "hann",
         nyquist=dom.unit_scale / (2.0 * step),
         resolution=dom.unit_scale / (n * step),
         interp=interp,
+        fit_method=fit,
+        grid_points=int(grid_points) if fit != "none" else 0,
     )
+
+    if fit != "none":
+        x_fit, y_fit = fit_samples(spec, lo, hi, dom)
+        degree = (int(baseline_degree) if baseline_degree is not None
+                  else BASELINE_DEGREE.get(detrend, 1))
+        if degree < 0:
+            raise ValueError("ベースラインの次数は 0 以上にしてください。")
 
     for j, name in enumerate(spec.column_names):
         freq, amp = fourier_transform(grid, signals[:, j], window=window,
@@ -565,6 +850,12 @@ def analyze_band(spec: SpectrumData, lo: float, hi: float, window: str = "hann",
         pk_freq, pk_amp = (parabolic_peak(freq, amp, idx) if refine_peak
                            else (float(freq[idx]), float(amp[idx])))
 
+        fit_result = None
+        if fit != "none":
+            fit_result = refine_peak_fit(
+                x_fit, y_fit[:, j], pk_freq, analysis.resolution, dom.unit_scale,
+                method=fit, degree=degree, n_grid=grid_points, max_iter=max_iter)
+
         analysis.results.append(ColumnFFTResult(
             column=name,
             condition=float(spec.conditions[j]),
@@ -573,6 +864,7 @@ def analyze_band(spec: SpectrumData, lo: float, hi: float, window: str = "hann",
             peak_frequency=pk_freq,
             peak_amplitude=pk_amp,
             peak_index=idx,
+            fit=fit_result,
         ))
     return analysis
 
@@ -584,7 +876,7 @@ def analyze_band(spec: SpectrumData, lo: float, hi: float, window: str = "hann",
 def fit_regression(analysis: BandAnalysis) -> RegressionResult:
     """条件 (列名) 対 振幅最大位置 の線形回帰と、ナイキスト到達条件の算出."""
     x = np.array([r.condition for r in analysis.results], dtype=float).reshape(-1, 1)
-    y = np.array([r.peak_frequency for r in analysis.results], dtype=float)
+    y = np.array([r.estimate for r in analysis.results], dtype=float)
 
     model = LinearRegression().fit(x, y)
     slope = float(model.coef_[0])
@@ -675,6 +967,12 @@ def plot_fourier_spectra(analysis: BandAnalysis, out_path: Path | None,
                 label=f"{res.column}")
         ax.plot([res.peak_frequency], [res.peak_amplitude], "o", ms=5,
                 color=color, mec="black", mew=0.6, zorder=5)
+    # 精密化した位置と振幅 (FFT の格子点の間にある真のピーク)
+    fitted = [r.fit for r in analysis.results if r.fit is not None]
+    if fitted:
+        ax.plot([f.frequency for f in fitted], [f.amplitude for f in fitted],
+                ls="none", marker="+", ms=11, mew=1.6, color="black", zorder=6,
+                label=f"{analysis.fit_method.upper()} fit")
 
     if x_hi >= nyq * 0.999:
         ax.axvline(nyq, color="crimson", ls="--", lw=1.2,
@@ -702,12 +1000,19 @@ def plot_peak_scatter(analysis: BandAnalysis, out_path: Path | None) -> plt.Figu
     dom = analysis.domain
     reg = analysis.regression or fit_regression(analysis)
     x = np.array([r.condition for r in analysis.results], dtype=float)
-    y = np.array([r.peak_frequency for r in analysis.results], dtype=float)
+    y = np.array([r.estimate for r in analysis.results], dtype=float)
     nyq = reg.nyquist
+    refined = analysis.fit_method != "none"
+    y_fft = np.array([r.peak_frequency for r in analysis.results], dtype=float)
 
     fig, ax = plt.subplots(figsize=(9, 6))
+    if refined:
+        # 精密化前の FFT の値を白抜きで重ね、補正量が見えるようにする
+        ax.scatter(x, y_fft, s=90, facecolor="none", edgecolor="0.45", lw=1.2,
+                   zorder=4, label="FFT peak")
     ax.scatter(x, y, s=70, color="#1f77b4", edgecolor="black", zorder=5,
-               label=f"Peak {dom.freq_short_en}")
+               label=(f"Peak {dom.freq_short_en} ({analysis.fit_method.upper()})"
+                      if refined else f"Peak {dom.freq_short_en}"))
 
     # 回帰直線 (交点が現実的な範囲にあれば、そこまで延長して描く)
     span = float(x.max() - x.min()) or 1.0
@@ -752,6 +1057,9 @@ def plot_peak_scatter(analysis: BandAnalysis, out_path: Path | None) -> plt.Figu
     y_span = float(y.max() - y.min())
     if (nyq - y.min()) > 0 and y_span < 0.25 * (nyq - y.min()):
         inset = ax.inset_axes((0.50, 0.42, 0.46, 0.34))
+        if refined:
+            inset.scatter(x, y_fft, s=50, facecolor="none", edgecolor="0.45",
+                          lw=1.0, zorder=4)
         inset.scatter(x, y, s=40, color="#1f77b4", edgecolor="black", zorder=5)
         xz = np.linspace(float(x.min()) - 0.05 * span, float(x.max()) + 0.05 * span, 50)
         inset.plot(xz, reg.slope * xz + reg.intercept, color="#ff7f0e", lw=1.5)
@@ -763,6 +1071,59 @@ def plot_peak_scatter(analysis: BandAnalysis, out_path: Path | None) -> plt.Figu
     fig.tight_layout()
     if out_path:
         fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    return fig
+
+
+#: フィット確認図で表示する縞の周期数
+FIT_CHECK_FRINGES = 8
+
+
+def plot_fit_check(analysis: BandAnalysis, out_path: Path | None) -> plt.Figure | None:
+    """精密化したモデルとデータの重なり具合を条件ごとに描画する.
+
+    周期の推定がずれていると、帯域中央から離れるほど位相のずれが大きくなる。
+    そこで差が最も目立つ帯域の端 (独立変数の大きい側) の数周期を拡大して見せる。
+    """
+    fitted = [r for r in analysis.results if r.fit is not None]
+    if not fitted:
+        return None
+    dom = analysis.domain
+    ncols = min(3, len(fitted))
+    nrows = int(np.ceil(len(fitted) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.6 * ncols, 2.9 * nrows),
+                             squeeze=False)
+    colors = _condition_palette(len(analysis.results))
+    color_of = {r.column: c for r, c in zip(analysis.results, colors)}
+
+    for ax, res in zip(axes.flat, fitted):
+        fr = res.fit
+        native = fr.frequency / dom.unit_scale            # 独立変数 1 単位あたりの周期
+        span = FIT_CHECK_FRINGES / native if native > 0 else np.inf
+        mask = fr.x >= fr.x.max() - span
+        x_dense = np.linspace(fr.x[mask].min(), fr.x[mask].max(), 1500)
+        ax.plot(x_dense, fr.evaluate(x_dense), "-", lw=1.1,
+                color=color_of[res.column], label="fit", zorder=2)
+        ax.plot(fr.x[mask], fr.y[mask], "o", ms=2.6, color="black",
+                label="data", zorder=3)
+        ax.set_title(f"condition {res.column}: {fr.frequency:.6g} {dom.freq_unit_en}",
+                     fontsize=9)
+        ax.text(0.02, 0.04, f"$R^2$ = {fr.r2:.5f}\nRMSE = {fr.rmse:.2e}",
+                transform=ax.transAxes, fontsize=8, va="bottom",
+                bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85))
+        ax.tick_params(labelsize=7)
+        if dom.key == "wavenumber":
+            ax.ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
+    for ax in list(axes.flat)[len(fitted):]:
+        ax.axis("off")
+
+    fig.suptitle(f"Fit check  ({analysis.band[0]:g}-{analysis.band[1]:g} nm, "
+                 f"domain: {dom.key}, method: {analysis.fit_method.upper()}, "
+                 f"last ~{FIT_CHECK_FRINGES} fringes of the band)", fontsize=10)
+    fig.supxlabel(dom.sample_axis_label, fontsize=9)
+    fig.supylabel("Reflectance", fontsize=9)
+    fig.tight_layout()
+    if out_path:
+        fig.savefig(out_path, dpi=130)
     return fig
 
 
@@ -785,25 +1146,50 @@ def is_near_nyquist(analysis: BandAnalysis, peak: float) -> bool:
     return peak >= analysis.nyquist - NEAR_NYQUIST_MARGIN * analysis.resolution
 
 
+#: フィットの決定係数がこれを下回ったら、正弦波モデルが合っていないと警告する
+FIT_R2_WARN = 0.9
+
+
 def peaks_dataframe(analysis: BandAnalysis,
                     refractive_index: float | None = None) -> pd.DataFrame:
-    """列ごとのピーク情報を DataFrame にまとめる."""
+    """列ごとのピーク情報を DataFrame にまとめる.
+
+    dom.peak_col の列には最終推定値 (精密化していれば精密化後の値) が入る。
+    精密化した場合は、FFT とグリッドサーチの値、標準誤差、フィットの品質も付く。
+    """
     dom = analysis.domain
+    res = analysis.results
     df = pd.DataFrame({
-        "column": [r.column for r in analysis.results],
-        "condition": [r.condition for r in analysis.results],
-        dom.peak_col: [r.peak_frequency for r in analysis.results],
-        "peak_amplitude": [r.peak_amplitude for r in analysis.results],
+        "column": [r.column for r in res],
+        "condition": [r.condition for r in res],
+        dom.peak_col: [r.estimate for r in res],
+        "peak_amplitude": [r.peak_amplitude for r in res],
         dom.nyquist_col: analysis.nyquist,
-        "peak_over_nyquist_ratio": [r.peak_frequency / analysis.nyquist
-                                    for r in analysis.results],
-        "near_nyquist": [is_near_nyquist(analysis, r.peak_frequency)
-                         for r in analysis.results],
+        "peak_over_nyquist_ratio": [r.estimate / analysis.nyquist for r in res],
+        "near_nyquist": [is_near_nyquist(analysis, r.estimate) for r in res],
     })
+
+    if analysis.fit_method != "none":
+        df["peak_method"] = analysis.fit_method
+        df[f"fft_{dom.peak_col}"] = [r.peak_frequency for r in res]
+        df[f"grid_{dom.peak_col}"] = [r.fit.grid_frequency for r in res]
+        if analysis.fit_method == "lm":
+            df[f"{dom.peak_col}_stderr"] = [r.fit.stderr for r in res]
+        df["fit_amplitude"] = [r.fit.amplitude for r in res]
+        df["fit_phase_rad"] = [r.fit.phase for r in res]
+        df["fit_r2"] = [r.fit.r2 for r in res]
+        df["fit_rmse"] = [r.fit.rmse for r in res]
+        if analysis.fit_method == "lm":
+            df["fit_iterations"] = [r.fit.iterations for r in res]
+            df["fit_converged"] = [r.fit.converged for r in res]
+        df["fit_note"] = [r.fit.note for r in res]
+
     # 波数ドメインでは光路差から膜厚 d = OPD / (2n) を推定できる
     if dom.key == "wavenumber" and refractive_index:
-        df["estimated_thickness_nm"] = (
-            df[dom.peak_col] / (2.0 * float(refractive_index)))
+        n_ref = 2.0 * float(refractive_index)
+        df["estimated_thickness_nm"] = df[dom.peak_col] / n_ref
+        if f"{dom.peak_col}_stderr" in df.columns:
+            df["estimated_thickness_stderr_nm"] = df[f"{dom.peak_col}_stderr"] / n_ref
     return df
 
 
@@ -825,12 +1211,27 @@ def summary_dict(spec: SpectrumData, analysis: BandAnalysis,
         entry = {
             "column": r.column,
             "condition": r.condition,
-            dom.peak_col: r.peak_frequency,
+            dom.peak_col: r.estimate,
             "peak_amplitude": r.peak_amplitude,
         }
+        if r.fit is not None:
+            entry["fit"] = {
+                "method": r.fit.method,
+                "fft_peak": r.fit.fft_frequency,
+                "grid_peak": r.fit.grid_frequency,
+                "peak": r.fit.frequency,
+                "stderr": r.fit.stderr,
+                "amplitude": r.fit.amplitude,
+                "phase_rad": r.fit.phase,
+                "r2": r.fit.r2,
+                "rmse": r.fit.rmse,
+                "iterations": r.fit.iterations,
+                "converged": r.fit.converged,
+                "note": r.fit.note,
+            }
         if dom.key == "wavenumber" and refractive_index:
             entry["estimated_thickness_nm"] = (
-                r.peak_frequency / (2.0 * float(refractive_index)))
+                r.estimate / (2.0 * float(refractive_index)))
         columns.append(entry)
 
     return {
@@ -848,6 +1249,10 @@ def summary_dict(spec: SpectrumData, analysis: BandAnalysis,
         "detrend": analysis.detrend,
         "zero_pad_factor": analysis.zero_pad,
         "interpolation": analysis.interp,
+        "peak_method": analysis.fit_method,
+        "grid_points": analysis.grid_points or None,
+        "grid_half_width_in_resolution": (GRID_HALF_WIDTH
+                                          if analysis.fit_method != "none" else None),
         "refractive_index": refractive_index,
         dom.nyquist_col: analysis.nyquist,
         "resolution": analysis.resolution,
@@ -882,12 +1287,43 @@ def print_report(spec: SpectrumData, analysis: BandAnalysis,
     print(f" サンプリング間隔 {dom.jp_step} : {analysis.step:.6g}")
     print(f" ナイキスト限界      : {analysis.nyquist:.6g} {dom.jp_freq_unit}")
     print(f" 分解能              : {analysis.resolution:.6g} {dom.jp_freq_unit}")
+    method_label = {
+        "none": "なし (FFT のピーク位置をそのまま使用)",
+        "grid": (f"FFT -> グリッドサーチ (±{GRID_HALF_WIDTH:g}×分解能 を "
+                 f"{analysis.grid_points} 分割)"),
+        "lm": (f"FFT -> グリッドサーチ (±{GRID_HALF_WIDTH:g}×分解能 を "
+               f"{analysis.grid_points} 分割) -> Levenberg-Marquardt 法"),
+    }[analysis.fit_method]
+    print(f" 精密化              : {method_label}")
     print(bar)
-    cols = ["column", "condition", dom.peak_col, "peak_amplitude"]
+
     df = peaks_dataframe(analysis, refractive_index)
+    if analysis.fit_method == "none":
+        cols = ["column", "condition", dom.peak_col, "peak_amplitude"]
+    else:
+        cols = ["column", "condition", f"fft_{dom.peak_col}",
+                f"grid_{dom.peak_col}"]
+        if analysis.fit_method == "lm":
+            cols += [dom.peak_col, f"{dom.peak_col}_stderr"]
+        cols += ["fit_amplitude", "fit_r2"]
     if "estimated_thickness_nm" in df.columns:
         cols.append("estimated_thickness_nm")
-    print(df[cols].to_string(index=False, float_format=lambda v: f"{v:.6g}"))
+    print(df[cols].to_string(index=False, float_format=lambda v: f"{v:.8g}"))
+
+    if analysis.fit_method != "none":
+        poor = df.loc[df["fit_r2"] < FIT_R2_WARN, "column"].tolist()
+        notes = df.loc[df["fit_note"] != "", ["column", "fit_note"]]
+        if poor or len(notes):
+            print(bar)
+        if poor:
+            print(f" [警告] 列 {', '.join(poor)} はフィットの決定係数が "
+                  f"{FIT_R2_WARN} 未満です。")
+            print("        単一の正弦波モデルがデータに合っていません。縞の間隔が帯域内で")
+            print("        変化している (波長ドメインで広帯域を見ている、分散が大きい)、")
+            print("        複数の縞が重なっている、などが考えられます。精密化の値は")
+            print("        信頼できないので、波数ドメインや帯域の分割を検討してください。")
+        for _, row in notes.iterrows():
+            print(f" [注意] 列 {row['column']}: {row['fit_note']}")
 
     near = df.loc[df["near_nyquist"], "column"].tolist()
     if near:
@@ -969,6 +1405,18 @@ def build_parser() -> argparse.ArgumentParser:
                         help="ピーク探索の下限値 (共役軸の単位, 既定: 0 = 直流のみ除外)")
     parser.add_argument("--refine-peak", action="store_true",
                         help="放物線近似でピーク位置をサブビン精度に補正する")
+    parser.add_argument("-f", "--fit", choices=list(FIT_METHODS), default="none",
+                        help="FFT 結果の精密化: none (FFT のみ) / grid (グリッドサーチ) / "
+                             "lm (グリッドサーチ + Levenberg-Marquardt 法)。"
+                             "Quinten (2019) の手法 (既定: none)")
+    parser.add_argument("--grid-points", type=int, default=DEFAULT_GRID_POINTS,
+                        help=f"グリッドサーチの分割数 M。±{GRID_HALF_WIDTH:g}×分解能 を "
+                             f"M 等分する (既定: {DEFAULT_GRID_POINTS})")
+    parser.add_argument("--max-iter", type=int, default=100,
+                        help="Levenberg-Marquardt 法の最大反復回数 (既定: 100)")
+    parser.add_argument("--baseline-degree", type=int, default=None,
+                        help="精密化モデルのベースライン多項式の次数 "
+                             "(既定: --detrend linear なら 1、それ以外は 0)")
     parser.add_argument("-n", "--refractive-index", type=float, default=None,
                         help="屈折率 n。波数ドメインで膜厚 d = OPD/(2n) を推定する")
     parser.add_argument("-o", "--outdir", default="output",
@@ -1067,6 +1515,16 @@ def prompt_settings(args: argparse.Namespace, spec: SpectrumData) -> argparse.Na
             if beta:
                 args.kaiser_beta = float(beta)
         break
+
+    while True:
+        fit = input(f"\n精密化 [none / grid / lm] (Enter で {args.fit}): ").strip().lower()
+        if not fit:
+            break
+        if fit not in FIT_METHODS:
+            print(f"  入力エラー: {fit!r} ({' / '.join(FIT_METHODS)} から選択)")
+            continue
+        args.fit = fit
+        break
     print()
     return args
 
@@ -1078,7 +1536,9 @@ def run_band(spec: SpectrumData, band: tuple[float, float], domain: DomainInfo,
                             detrend=args.detrend, zero_pad=args.zero_pad,
                             kaiser_beta=args.kaiser_beta,
                             peak_min=args.peak_min, refine_peak=args.refine_peak,
-                            domain=domain, interp=args.interp)
+                            domain=domain, interp=args.interp, fit=args.fit,
+                            grid_points=args.grid_points, max_iter=args.max_iter,
+                            baseline_degree=args.baseline_degree)
     fit_regression(analysis)
     n_ref = args.refractive_index
     print_report(spec, analysis, n_ref)
@@ -1095,6 +1555,8 @@ def run_band(spec: SpectrumData, band: tuple[float, float], domain: DomainInfo,
     plot_fourier_spectra(analysis, Path(f"{prefix}_fourier_spectrum.png"),
                          xmax=args.xmax)
     plot_peak_scatter(analysis, Path(f"{prefix}_peak_regression.png"))
+    if analysis.fit_method != "none":
+        plot_fit_check(analysis, Path(f"{prefix}_fit_check.png"))
     if not args.no_raw_plot:
         plot_raw_spectra(spec, analysis, Path(f"{prefix}_raw_spectra.png"))
 
